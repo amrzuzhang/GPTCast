@@ -1,14 +1,16 @@
 <div align="center">
 
-# GPTCast: a weather language model for precipitation nowcasting
+# GPTCast-SWVL1: a weather language model for soil moisture forecasting (ERA5-Land)
+
+_Fork of GPTCast (Franch et al., GMD 2025), adapted to ERA5-Land `swvl1` (volumetric soil water, layer 1)._
 
 <a href="https://pytorch.org/get-started/locally/"><img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-ee4c2c?logo=pytorch&logoColor=white"></a>
 <a href="https://pytorchlightning.ai/"><img alt="Lightning" src="https://img.shields.io/badge/-Lightning-792ee5?logo=pytorchlightning&logoColor=white"></a>
 <a href="https://hydra.cc/"><img alt="Config: Hydra" src="https://img.shields.io/badge/Config-Hydra-89b8cd"></a>
 <a href="https://github.com/ashleve/lightning-hydra-template"><img alt="Template" src="https://img.shields.io/badge/-Lightning--Hydra--Template-017F2F?style=flat&logo=github&labelColor=gray"></a><br>
-[![Paper](http://img.shields.io/badge/paper-GMD-B31B1B.svg)](https://doi.org/10.5194/gmd-18-5351-2025)
-[![Data](http://img.shields.io/badge/Data-Zenodo-4b44ce.svg)](https://doi.org/10.5281/zenodo.13692016)
-[![Models](http://img.shields.io/badge/Models-Zenodo-4b44ce.svg)](https://doi.org/10.5281/zenodo.13594332)
+[![Upstream Paper](http://img.shields.io/badge/upstream%20paper-GMD-B31B1B.svg)](https://doi.org/10.5194/gmd-18-5351-2025)
+[![Upstream Data](http://img.shields.io/badge/upstream%20data-Zenodo-4b44ce.svg)](https://doi.org/10.5281/zenodo.13692016)
+[![Upstream Models](http://img.shields.io/badge/upstream%20models-Zenodo-4b44ce.svg)](https://doi.org/10.5281/zenodo.13594332)
 
 </div>
 
@@ -16,7 +18,14 @@
 
 ## Description
 
-Code release for the paper <b>"GPTCast: a weather language model for precipitation nowcasting"</b>
+This repository is a **fork** of the original GPTCast codebase.
+
+The upstream project targets **precipitation/radar nowcasting**. This fork keeps the overall code structure and
+adapts it to **forecast daily soil moisture** using **ERA5-Land**:
+- target variable: `swvl1` (volumetric soil water layer 1)
+- typical use case: predict `d+1 ... d+7` from a 7-day context window (see notes in configs/notebooks)
+
+### Upstream Reference (GPTCast paper)
 
 ```
 @Article{gmd-18-5351-2025,
@@ -32,11 +41,11 @@ DOI = {10.5194/gmd-18-5351-2025}
 }
 ```
 
-<b>paper</b>: [https://gmd.copernicus.org/articles/18/5351/2025/](https://doi.org/10.5194/gmd-18-5351-2025)
+<b>upstream paper</b>: [https://gmd.copernicus.org/articles/18/5351/2025/](https://doi.org/10.5194/gmd-18-5351-2025)
 
-<b>data</b>: https://doi.org/10.5281/zenodo.13692016
+<b>upstream data</b>: https://doi.org/10.5281/zenodo.13692016
 
-<b>models</b>: https://doi.org/10.5281/zenodo.13594332
+<b>upstream models</b>: https://doi.org/10.5281/zenodo.13594332
 
 
 ## Fork Notes (ERA5-Land SWVL1)
