@@ -39,22 +39,51 @@ DOI = {10.5194/gmd-18-5351-2025}
 <b>models</b>: https://doi.org/10.5281/zenodo.13594332
 
 
+## Fork Notes (ERA5-Land SWVL1)
+
+This repository is a fork of the original GPTCast codebase.
+In addition to the upstream precipitation/radar nowcasting workflow, this fork adds **ERA5-Land soil moisture**
+support for experimenting with **`swvl1` (volumetric soil water, layer 1)** forecasting.
+
+What is added in this fork:
+- Dataset + LightningDataModule:
+  - `gptcast/data/era5land_swvl1.py`
+  - `gptcast/data/era5land_swvl1_datamodule.py`
+- Hydra configs (same overall structure as the upstream experiments):
+  - `configs/data/era5land_swvl1.yaml`
+  - `configs/experiment/vaeganvq_mwae_era5land_swvl1.yaml` (first stage)
+  - `configs/experiment/gptcast_16x16_era5land_swvl1.yaml` (second stage)
+- Notebooks that **mirror the original notebook structure and plotting style**:
+  - `notebooks/swvl1/example_autoencoder_reconstruction.ipynb`
+  - `notebooks/swvl1/example_gptcast_forecast.ipynb`
+
+Data is intentionally **not included** in this repo because it is large.
+
+
 ## How to run
 
-Install dependencies
+### Environment
+
+This fork is commonly used with a Conda environment (single GPU is supported).
+
+Hydra expects the env var `PROJECT_ROOT` to be set:
 
 ```bash
-# install python3.12 on ubuntu
-bash install_python_ubuntu.sh
-
-# create environment with poetry
-bash create_environment.sh
-
-# activate the environment
-source .venv/bin/activate 
+cd /path/to/GPTCast
+export PROJECT_ROOT="$(pwd)"
 ```
 
-## Use the pretrained models
+Example Conda setup:
+
+```bash
+conda create -n gptcast python=3.12 -y
+conda activate gptcast
+
+# Install package + dependencies
+pip install -e .
+```
+
+### Use The Pretrained Models (Upstream, Precip/Radar)
 
 Check the notebooks in the [notebooks](notebooks/) folder on how to use the pretrained models.
 
@@ -62,13 +91,46 @@ Check the notebooks in the [notebooks](notebooks/) folder on how to use the pret
 
 - See the notebook [notebooks/example_autoencoder_reconstruction.ipynb](notebooks/example_autoencoder_reconstruction.ipynb) for a test on the VAE reconstruction.
 
+
+### ERA5-Land SWVL1 (Soil Moisture) Notebooks (This Fork)
+
+These notebooks are the SWVL1 equivalents of the upstream examples and keep the same cell order/logic as much as possible:
+- `notebooks/swvl1/example_autoencoder_reconstruction.ipynb`
+- `notebooks/swvl1/example_gptcast_forecast.ipynb`
+
+Note: `pysteps` is **optional** and only needed for the original precipitation plotting utilities.
+The SWVL1 notebooks use `plot_era5land(...)` / `plot_mutiple_era5land(...)` from `gptcast/utils/plotting.py`.
+
+
 ## Training
 
-To train the model on the original dataset, first run the script in the [data](data/) folder to download the dataset.
+### Upstream Dataset (Precip/Radar)
+
+To train the model on the original dataset, run the script in the [data](data/) folder to download it:
 
 ```bash
 # download the dataset
 python data/download_data.py
+```
+
+### ERA5-Land SWVL1 Dataset Layout (This Fork)
+
+This fork assumes you already have the yearly ERA5-Land NetCDFs locally.
+
+Expected layout:
+
+```
+data/0.1/1/land_surface/<YEAR>/volumetric_soil_water_layer_1.nc
+```
+
+The NetCDF is expected to contain:
+- variable `swvl1`
+- coordinates including `time` (daily), `latitude`, `longitude`
+
+Generate the MIARAD-style metadata CSVs (yearly rows) with:
+
+```bash
+python data/make_era5land_swvl1_csv_yearly.py
 ```
 
 ### Train the VAE
@@ -79,7 +141,18 @@ Train the first stage (the VAE) with one of the following configurations contain
 ```bash
 # train a VAE with WMAE reconstruction loss on GPU
 # the result (including model checkpoints) will be saved in the folder `logs/train/`
-python gptcast/train.py trainer=gpu experiment=vaeganvq_mwae.yaml 
+python gptcast/train.py trainer=gpu experiment=vaeganvq_mwae
+```
+
+Train the SWVL1 VAE (this fork):
+
+```bash
+python gptcast/train.py trainer=gpu experiment=vaeganvq_mwae_era5land_swvl1
+
+# quick smoke test (Hydra strict mode requires '+' for new keys)
+python gptcast/train.py trainer=gpu experiment=vaeganvq_mwae_era5land_swvl1 \
+  trainer.max_epochs=1 +trainer.limit_train_batches=50 +trainer.limit_val_batches=10 \
+  data.batch_size=2 data.num_workers=0
 ```
 
 ### Train GPTCast
@@ -91,5 +164,20 @@ After training the VAE, train the GPTCast model with one of the following config
 # train GPTCast with a 16x16 token spatial context on GPU
 # the result (including model checkpoints) will be saved in the folder `logs/train/`
 # the VAE checkpoint path should be provided
-python gptcast/train.py trainer=gpu experiment=gptcast_16x16.yaml model.first_stage.ckpt_path=<path_to_vae_checkpoint>
+python gptcast/train.py trainer=gpu experiment=gptcast_16x16 model.first_stage.ckpt_path=<path_to_vae_checkpoint>
 ```
+
+Train the SWVL1 GPTCast forecaster (this fork):
+
+```bash
+python gptcast/train.py trainer=gpu experiment=gptcast_16x16_era5land_swvl1 \
+  model.first_stage.ckpt_path=<path_to_swvl1_vae_checkpoint>
+
+# quick smoke test
+python gptcast/train.py trainer=gpu experiment=gptcast_16x16_era5land_swvl1 \
+  model.first_stage.ckpt_path=<path_to_swvl1_vae_checkpoint> \
+  trainer.max_epochs=1 +trainer.limit_train_batches=50 +trainer.limit_val_batches=10 \
+  data.batch_size=2 data.num_workers=0
+```
+
+Practical note: the provided inference utilities in `gptcast/models/gptcast.py` are designed for a maximum context length of **7 steps** (with `block_size=2048`), even though training uses 8 stacked frames.
