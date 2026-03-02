@@ -145,6 +145,13 @@ dmypy.json
 *.tar
 *.tar.gz
 
+# Local paper copies / exports (do not commit copyrighted PDFs/text dumps)
+Franch*GPTCast*.pdf
+Franch_2025_GPTCast_paper.txt
+
+# Windows alternate data streams copied from other OSes
+*:Zone.Identifier
+
 # Lightning-Hydra-Template
 configs/local/default.yaml
 /data/*.csv

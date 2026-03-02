@@ -1,1 +1,2 @@
 from .miarad_datamodule import MiaradDataModule
+from .era5land_swvl1_datamodule import Era5LandSwvl1DataModule
