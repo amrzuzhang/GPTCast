@@ -116,7 +116,12 @@ def _ensure_netcdf_inplace(path: Path) -> None:
     if _is_zip(path):
         tmp_out = path.parent / (path.name + ".tmp")
         try:
-            with zipfile.ZipFile(path) as zf:
+            try:
+                zf_ctx = zipfile.ZipFile(path)
+            except zipfile.BadZipFile as e:
+                raise ValueError(f"Corrupted ZIP (likely partial download): {path}") from e
+
+            with zf_ctx as zf:
                 members = [m for m in zf.namelist() if not m.endswith("/")]
                 if not members:
                     raise ValueError(f"ZIP archive is empty: {path}")
@@ -151,6 +156,99 @@ def _ensure_netcdf_inplace(path: Path) -> None:
     raise ValueError(
         f"File is neither NetCDF nor ZIP (CDS sometimes returns ZIP-wrapped NetCDF). "
         f"Bad file: {path}"
+    )
+
+
+def _download_month(
+    *,
+    client,
+    dataset: str,
+    var_request: str,
+    year: int,
+    month: int,
+    time: str,
+    area_list: Sequence[float],
+    out_path: Path,
+) -> None:
+    m = _month_str(month)
+    req = {
+        "product_type": "reanalysis",
+        "variable": var_request,
+        "year": str(year),
+        "month": m,
+        "day": _day_list(year, month),
+        "time": time,
+        "area": list(area_list),
+        "format": "netcdf",
+    }
+
+    print(f"[download] year={year} month={m} -> {out_path.name}")
+    client.retrieve(dataset, req, str(out_path))
+
+
+def _ensure_month_ok_or_redownload(
+    *,
+    client,
+    dataset: str,
+    var_request: str,
+    year: int,
+    month: int,
+    time: str,
+    area_list: Sequence[float],
+    month_path: Path,
+    overwrite: bool,
+    max_attempts: int = 3,
+) -> None:
+    """Validate or (re)download a monthly file.
+
+    This handles the common failure mode where CDS leaves a partial/corrupt file
+    on disk (e.g. truncated ZIP). In that case we delete and retry the download.
+    """
+
+    last_err: Exception | None = None
+    for attempt in range(1, int(max_attempts) + 1):
+        if month_path.exists() and not overwrite:
+            try:
+                _ensure_netcdf_inplace(month_path)
+                return
+            except Exception as e:
+                last_err = e
+                print(
+                    f"[warn] year={year} month={month:02d} existing file invalid "
+                    f"(attempt {attempt}/{max_attempts}): {type(e).__name__}: {e}"
+                )
+                try:
+                    month_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+        try:
+            _download_month(
+                client=client,
+                dataset=dataset,
+                var_request=var_request,
+                year=year,
+                month=month,
+                time=time,
+                area_list=area_list,
+                out_path=month_path,
+            )
+            _ensure_netcdf_inplace(month_path)
+            return
+        except Exception as e:
+            last_err = e
+            print(
+                f"[warn] year={year} month={month:02d} download/convert failed "
+                f"(attempt {attempt}/{max_attempts}): {type(e).__name__}: {e}"
+            )
+            try:
+                month_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    raise RuntimeError(
+        f"Failed to obtain a valid monthly file after {max_attempts} attempts: {month_path}\n"
+        f"Last error: {type(last_err).__name__}: {last_err}"
     )
 
 
@@ -254,26 +352,18 @@ def _download_one_year(
         m = _month_str(month)
         month_path = tmp_dir / f"{var_request}_{year}{m}.nc"
         month_paths.append(month_path)
-
-        if month_path.exists() and not overwrite:
-            print(f"[skip] {month_path.name} exists")
-            _ensure_netcdf_inplace(month_path)
-            continue
-
-        req = {
-            "product_type": "reanalysis",
-            "variable": var_request,
-            "year": str(year),
-            "month": m,
-            "day": _day_list(year, month),
-            "time": time,
-            "area": list(area_list),
-            "format": "netcdf",
-        }
-
-        print(f"[download] year={year} month={m} -> {month_path.name}")
-        client.retrieve(dataset, req, str(month_path))
-        _ensure_netcdf_inplace(month_path)
+        _ensure_month_ok_or_redownload(
+            client=client,
+            dataset=dataset,
+            var_request=var_request,
+            year=year,
+            month=month,
+            time=time,
+            area_list=area_list,
+            month_path=month_path,
+            overwrite=overwrite,
+            max_attempts=3,
+        )
 
     print(f"[concat] year={year} -> {yearly_path.name}")
     _concat_months_to_year(
