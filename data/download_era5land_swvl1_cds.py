@@ -28,12 +28,13 @@ Notes:
 from __future__ import annotations
 
 import calendar
+import concurrent.futures as cf
 import os
 import shutil
 import sys
 import zipfile
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, Tuple
 
 
 def _require(module_name: str) -> None:
@@ -224,6 +225,111 @@ def _concat_months_to_year(
                 pass
 
 
+def _download_one_year(
+    *,
+    year: int,
+    out_root: Path,
+    client,
+    dataset: str,
+    var_request: str,
+    time: str,
+    area_list: Sequence[float],
+    overwrite: bool,
+    keep_monthly: bool,
+    compression_level: int,
+    yearly_filename: str,
+) -> str:
+    year_dir = out_root / str(year)
+    year_dir.mkdir(parents=True, exist_ok=True)
+    yearly_path = year_dir / yearly_filename
+
+    if yearly_path.exists() and not overwrite:
+        return f"[skip] {yearly_path} exists"
+
+    tmp_dir = year_dir / "_tmp_monthly"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    month_paths: list[Path] = []
+    for month in range(1, 13):
+        m = _month_str(month)
+        month_path = tmp_dir / f"{var_request}_{year}{m}.nc"
+        month_paths.append(month_path)
+
+        if month_path.exists() and not overwrite:
+            print(f"[skip] {month_path.name} exists")
+            _ensure_netcdf_inplace(month_path)
+            continue
+
+        req = {
+            "product_type": "reanalysis",
+            "variable": var_request,
+            "year": str(year),
+            "month": m,
+            "day": _day_list(year, month),
+            "time": time,
+            "area": list(area_list),
+            "format": "netcdf",
+        }
+
+        print(f"[download] year={year} month={m} -> {month_path.name}")
+        client.retrieve(dataset, req, str(month_path))
+        _ensure_netcdf_inplace(month_path)
+
+    print(f"[concat] year={year} -> {yearly_path.name}")
+    _concat_months_to_year(
+        month_paths=month_paths,
+        out_path=yearly_path,
+        var_name="swvl1",
+        compression_level=compression_level,
+    )
+
+    if not keep_monthly:
+        for p in month_paths:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            # Directory not empty (partial downloads, etc.)
+            pass
+
+    return f"[done] {yearly_path}"
+
+
+def _download_one_year_worker(
+    year: int,
+    out_root: str,
+    dataset: str,
+    var_request: str,
+    time: str,
+    area_list: Tuple[float, float, float, float],
+    overwrite: bool,
+    keep_monthly: bool,
+    compression_level: int,
+    yearly_filename: str,
+) -> str:
+    # Each process creates its own cdsapi.Client; do NOT share clients across processes.
+    _require("cdsapi")
+    import cdsapi  # type: ignore
+
+    client = cdsapi.Client()
+    return _download_one_year(
+        year=int(year),
+        out_root=Path(out_root),
+        client=client,
+        dataset=str(dataset),
+        var_request=str(var_request),
+        time=str(time),
+        area_list=area_list,
+        overwrite=bool(overwrite),
+        keep_monthly=bool(keep_monthly),
+        compression_level=int(compression_level),
+        yearly_filename=str(yearly_filename),
+    )
+
+
 def download_era5land_swvl1(
     *,
     out_dir: str | None = None,
@@ -234,6 +340,7 @@ def download_era5land_swvl1(
     time: str = "12:00",
     # CDS bbox: [north, west, south, east] in degrees.
     area: Sequence[float] = (55.0, 70.0, 15.0, 140.0),
+    num_workers: int = 1,
     overwrite: bool = False,
     keep_monthly: bool = False,
     compression_level: int = 4,
@@ -272,9 +379,6 @@ def download_era5land_swvl1(
             f"got: {area!r}"
         )
 
-    _safe_print_cds_config_hint()
-    client = cdsapi.Client()
-
     dataset = "reanalysis-era5-land"
     var_request = "volumetric_soil_water_layer_1"
 
@@ -295,68 +399,62 @@ def download_era5land_swvl1(
         f"[era5land] time={time}\n"
         f"[era5land] area(N,W,S,E)={area_list}\n"
         f"[era5land] years={years_list[0]}..{years_list[-1]} (n={len(years_list)})\n"
-        f"[era5land] out_root={out_root}"
+        f"[era5land] out_root={out_root}\n"
+        f"[era5land] num_workers={int(num_workers)}"
     )
 
-    for year in years_list:
-        year_dir = out_root / str(year)
-        year_dir.mkdir(parents=True, exist_ok=True)
-        yearly_path = year_dir / yearly_filename
+    _safe_print_cds_config_hint()
 
-        if yearly_path.exists() and not overwrite:
-            print(f"[skip] {yearly_path} exists")
-            continue
+    workers = int(num_workers)
+    if workers < 1:
+        raise ValueError("num_workers must be >= 1")
 
-        tmp_dir = year_dir / "_tmp_monthly"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
+    if workers == 1:
+        client = cdsapi.Client()
+        for year in years_list:
+            msg = _download_one_year(
+                year=int(year),
+                out_root=out_root,
+                client=client,
+                dataset=dataset,
+                var_request=var_request,
+                time=time,
+                area_list=area_list,
+                overwrite=overwrite,
+                keep_monthly=keep_monthly,
+                compression_level=compression_level,
+                yearly_filename=yearly_filename,
+            )
+            print(msg)
+        return
 
-        month_paths: list[Path] = []
-        for month in range(1, 13):
-            m = _month_str(month)
-            month_path = tmp_dir / f"{var_request}_{year}{m}.nc"
-            month_paths.append(month_path)
-
-            if month_path.exists() and not overwrite:
-                print(f"[skip] {month_path.name} exists")
-                _ensure_netcdf_inplace(month_path)
-                continue
-
-            req = {
-                "product_type": "reanalysis",
-                "variable": var_request,
-                "year": str(year),
-                "month": m,
-                "day": _day_list(year, month),
-                "time": time,
-                "area": area_list,
-                "format": "netcdf",
-            }
-
-            print(f"[download] year={year} month={m} -> {month_path.name}")
-            client.retrieve(dataset, req, str(month_path))
-            _ensure_netcdf_inplace(month_path)
-
-        print(f"[concat] year={year} -> {yearly_path.name}")
-        _concat_months_to_year(
-            month_paths=month_paths,
-            out_path=yearly_path,
-            var_name="swvl1",
-            compression_level=compression_level,
-        )
-
-        if not keep_monthly:
-            for p in month_paths:
-                try:
-                    p.unlink()
-                except FileNotFoundError:
-                    pass
+    # Parallel across years. Keep this low (e.g. 2-3) to avoid CDS rate limits.
+    area_tuple = (area_list[0], area_list[1], area_list[2], area_list[3])
+    with cf.ProcessPoolExecutor(max_workers=workers) as ex:
+        fut_to_year = {
+            ex.submit(
+                _download_one_year_worker,
+                int(year),
+                str(out_root),
+                dataset,
+                var_request,
+                time,
+                area_tuple,
+                overwrite,
+                keep_monthly,
+                compression_level,
+                yearly_filename,
+            ): int(year)
+            for year in years_list
+        }
+        for fut in cf.as_completed(fut_to_year):
+            year = fut_to_year[fut]
             try:
-                tmp_dir.rmdir()
-            except OSError:
-                # Directory not empty (partial downloads, etc.)
-                pass
-
-        print(f"[done] {yearly_path}")
+                print(fut.result())
+            except Exception as e:
+                # Fail fast: resume is supported on re-run.
+                print(f"[error] year={year} failed: {type(e).__name__}: {e}", file=sys.stderr)
+                raise
 
 
 def main() -> None:
