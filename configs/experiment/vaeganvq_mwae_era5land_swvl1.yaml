@@ -18,7 +18,9 @@ data:
   max_mask_fraction: 0.40
   smart_crop_attempts: 50
   center_crop_val: False
-  batch_size: 8
+  # VAEGANVQ is memory-hungry; batch_size=8 can OOM on 16GB GPUs.
+  # Use 4 by default and override via CLI if you have more VRAM.
+  batch_size: 4
   num_workers: 0
 
 model:
