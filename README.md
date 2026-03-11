@@ -9,8 +9,6 @@ _Fork of GPTCast (Franch et al., GMD 2025), adapted to ERA5-Land `swvl1` (volume
 <a href="https://hydra.cc/"><img alt="Config: Hydra" src="https://img.shields.io/badge/Config-Hydra-89b8cd"></a>
 <a href="https://github.com/ashleve/lightning-hydra-template"><img alt="Template" src="https://img.shields.io/badge/-Lightning--Hydra--Template-017F2F?style=flat&logo=github&labelColor=gray"></a><br>
 [![Upstream Paper](http://img.shields.io/badge/upstream%20paper-GMD-B31B1B.svg)](https://doi.org/10.5194/gmd-18-5351-2025)
-[![Upstream Data](http://img.shields.io/badge/upstream%20data-Zenodo-4b44ce.svg)](https://doi.org/10.5281/zenodo.13692016)
-[![Upstream Models](http://img.shields.io/badge/upstream%20models-Zenodo-4b44ce.svg)](https://doi.org/10.5281/zenodo.13594332)
 
 </div>
 
@@ -43,11 +41,6 @@ DOI = {10.5194/gmd-18-5351-2025}
 
 <b>upstream paper</b>: [https://gmd.copernicus.org/articles/18/5351/2025/](https://doi.org/10.5194/gmd-18-5351-2025)
 
-<b>upstream data</b>: https://doi.org/10.5281/zenodo.13692016
-
-<b>upstream models</b>: https://doi.org/10.5281/zenodo.13594332
-
-
 ## Fork Notes (ERA5-Land SWVL1)
 
 This repository is a fork of the original GPTCast codebase.
@@ -60,7 +53,8 @@ What is added in this fork:
   - `gptcast/data/era5land_swvl1_datamodule.py`
 - Hydra configs (same overall structure as the upstream experiments):
   - `configs/data/era5land_swvl1.yaml`
-  - `configs/experiment/vaeganvq_mwae_era5land_swvl1.yaml` (first stage)
+  - `configs/experiment/vae_mae_swvl1.yaml` (baseline first stage)
+  - `configs/experiment/vae_phuber_swvl1.yaml` (main first stage)
   - `configs/experiment/gptcast_16x16_era5land_swvl1.yaml` (second stage)
 - Notebooks that **mirror the original notebook structure and plotting style**:
   - `notebooks/swvl1/example_autoencoder_reconstruction.ipynb`
@@ -142,24 +136,54 @@ Generate the MIARAD-style metadata CSVs (yearly rows) with:
 python data/make_era5land_swvl1_csv_yearly.py
 ```
 
+To download a more hydrology-oriented ERA5-Land dataset layout for the next stage
+(multi-layer soil moisture + forcing + runoff/ET), use:
+
+```bash
+python data/download_era5land_landbench_style_cds.py \
+  --download-profile hydrology \
+  --years 1979,1980,1981 \
+  --area 42.0,105.0,20.0,125.0 \
+  --time 12:00 \
+  --num-workers 1 \
+  --max-download-attempts 8
+```
+
+Profiles:
+- `baseline`: original forcing-only layout
+- `hydrology`: baseline + `swvl1-4`, evapotranspiration, runoff, root-zone derivatives
+- `full`: hydrology + ET component breakdown
+
+If CDS/object-store downloads are unstable, you can make retries more tolerant:
+
+```bash
+python data/download_era5land_landbench_style_cds.py \
+  --download-profile hydrology \
+  --year-start 1979 --year-end 2020 \
+  --max-download-attempts 12 \
+  --retry-sleep-seconds 10 \
+  --retry-backoff 2.0 \
+  --retry-jitter-seconds 2.0
+```
+
 ### Train the VAE
 Train the first stage (the VAE) with one of the following configurations contained in the folder [configs/experiment/](configs/experiment/):
 - [vaeganvq_mae](configs/experiment/vaeganvq_mae.yaml) - Mean Absolute Error loss
-- [vaeganvq_mwae](configs/experiment/vaeganvq_mwae.yaml) - Magnitude Weighted Absolute Error loss
 
 ```bash
-# train a VAE with WMAE reconstruction loss on GPU
+# train the original upstream MAE tokenizer on GPU
 # the result (including model checkpoints) will be saved in the folder `logs/train/`
-python gptcast/train.py trainer=gpu experiment=vaeganvq_mwae
+python gptcast/train.py trainer=gpu experiment=vaeganvq_mae
 ```
 
 Train the SWVL1 VAE (this fork):
 
 ```bash
-python gptcast/train.py trainer=gpu experiment=vaeganvq_mwae_era5land_swvl1
+python gptcast/train.py trainer=gpu experiment=vae_mae_swvl1
+python gptcast/train.py trainer=gpu experiment=vae_phuber_swvl1
 
 # quick smoke test (Hydra strict mode requires '+' for new keys)
-python gptcast/train.py trainer=gpu experiment=vaeganvq_mwae_era5land_swvl1 \
+python gptcast/train.py trainer=gpu experiment=vae_phuber_swvl1 \
   trainer.max_epochs=1 +trainer.limit_train_batches=50 +trainer.limit_val_batches=10 \
   data.batch_size=2 data.num_workers=0
 ```
@@ -190,3 +214,56 @@ python gptcast/train.py trainer=gpu experiment=gptcast_16x16_era5land_swvl1 \
 ```
 
 Practical note: the provided inference utilities in `gptcast/models/gptcast.py` are designed for a maximum context length of **7 steps** (with `block_size=2048`), even though training uses 8 stacked frames.
+
+## TensorBoard
+
+Each Hydra run writes TensorBoard logs under:
+
+```bash
+logs/train/runs/<timestamp>/tensorboard/
+```
+
+Launch TensorBoard locally for all local runs:
+
+```bash
+tensorboard --logdir /home/ang/GPTCast/logs/train --port 6006
+```
+
+To compare a local run with a server run, first sync only the TensorBoard logs
+(not the dataset) from the server:
+
+```bash
+mkdir -p /home/ang/GPTCast/logs_remote
+
+rsync -avz \
+  user@server:/path/to/GPTCast/logs/train/runs/2026-03-11_17-28-06/tensorboard/ \
+  /home/ang/GPTCast/logs_remote/server_vae_phuber_swvl1/
+```
+
+Then launch TensorBoard with named log roots:
+
+```bash
+tensorboard --logdir_spec \
+local:/home/ang/GPTCast/logs/train,\
+server:/home/ang/GPTCast/logs_remote \
+--port 6006
+```
+
+If you prefer not to copy logs, run TensorBoard on the server and forward the port:
+
+```bash
+# on server
+cd /path/to/GPTCast
+tensorboard --logdir logs/train --port 6006
+```
+
+```bash
+# on local machine
+ssh -L 6006:localhost:6006 user@server
+```
+
+Open:
+
+```text
+http://localhost:6006
+```

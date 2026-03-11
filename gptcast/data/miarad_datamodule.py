@@ -7,7 +7,6 @@ from pandas import DataFrame
 from pathlib import Path
  
 from gptcast.data.miarad import Miarad, MiaradN
-from gptcast.utils.downloads import download_dataset
 
 
 class MiaradDataModule(LightningDataModule):
@@ -42,27 +41,6 @@ class MiaradDataModule(LightningDataModule):
     default_train_metadata_path = str(default_data_path / "miarad_training.csv"),
     default_test_tarfile_path = str(default_data_path / "miarad_test.tar"),
     default_test_metadata_path = str(default_data_path / "miarad_test.csv"),
-
-    @classmethod
-    def  load_from_zenodo(cls, path: Optional[str] = None, **kwargs) -> 'MiaradDataModule':
-        """Load the dataset from Zenodo. 
-
-        Args:
-            **kwargs: Additional arguments to pass to the constructor.
-
-        Returns:
-            MiaradDataModule: The dataset.
-        """
-        data_path = cls.default_data_path if path is None else Path(path)
-        assert download_dataset("miarad", data_path), "Failed to download miarad dataset"
-        return cls(
-            train_tarfile_path = str(data_path / "miarad_training.tar"),
-            train_metadata_path_or_df = str(data_path / "miarad_training.csv"),
-            test_tarfile_path = str(data_path / "miarad_test.tar"),
-            test_metadata_path_or_df = str(data_path / "miarad_test.csv"),
-            **kwargs
-        )
-
 
     def __init__(
         self,

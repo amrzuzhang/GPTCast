@@ -8,8 +8,12 @@ from pathlib import Path
 
 from gptcast.models.components.vaegan import Encoder, Decoder, VectorQuantizer
 from gptcast.models.components.vaegan.losses import DummyLoss
-from gptcast.utils.converters import dbz_to_rainfall, rainfall_to_dbz
-from gptcast.utils.downloads import download_pretrained_model
+from gptcast.utils.converters import (
+    dbz_to_rainfall,
+    rainfall_to_dbz,
+    swvl1_norm_to_phys,
+    swvl1_phys_to_norm,
+)
 
 
 # base class for a VAE with GAN loss
@@ -24,6 +28,7 @@ class VAEGAN(L.LightningModule):
                  ckpt_path=None,
                  ignore_keys=[],
                  image_key="image",
+                 mask_key="mask",
                  base_learning_rate=1e-4,
                  freeze_weights=False,
                  clip_grads=False,
@@ -108,6 +113,14 @@ class VAEGAN(L.LightningModule):
             x = x[..., None]
         x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
         return x
+
+    def get_mask(self, batch, k):
+        if k is None or k not in batch:
+            return None
+        mask = batch[k]
+        if len(mask.shape) == 3:
+            mask = mask[:, None, ...]
+        return mask.to(memory_format=torch.contiguous_format).bool()
     
     def _get_tensorboard_logger(self):
         for l in self.loggers:
@@ -129,6 +142,7 @@ class VAEGAN(L.LightningModule):
     def training_step(self, batch, batch_idx):
         ae_opt, d_opt = self.optimizers()
         inputs = self.get_input(batch, self.hparams.image_key)
+        spatial_mask = self.get_mask(batch, self.hparams.mask_key)
         reconstructions, extra_term = self(inputs)
 
         self.log("train/global_step", float(self.global_step), prog_bar=True, logger=True, on_step=True, sync_dist=True)
@@ -137,7 +151,7 @@ class VAEGAN(L.LightningModule):
         optimizer_idx = 0
         self.toggle_optimizer(ae_opt)
         aeloss, log_dict_ae = self.loss(inputs, reconstructions, extra_term, optimizer_idx, self.global_step,
-                                        last_layer=self.get_last_layer(), split="train")
+                                        last_layer=self.get_last_layer(), split="train", spatial_mask=spatial_mask)
         self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         # self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
         ae_opt.zero_grad()
@@ -151,7 +165,7 @@ class VAEGAN(L.LightningModule):
         optimizer_idx = 1
         self.toggle_optimizer(d_opt)
         discloss, log_dict_disc = self.loss(inputs, reconstructions, extra_term, optimizer_idx, self.global_step,
-                                        last_layer=self.get_last_layer(), split="train")
+                                        last_layer=self.get_last_layer(), split="train", spatial_mask=spatial_mask)
         self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         # self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
         d_opt.zero_grad()
@@ -168,14 +182,15 @@ class VAEGAN(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         inputs = self.get_input(batch, self.hparams.image_key)
+        spatial_mask = self.get_mask(batch, self.hparams.mask_key)
         reconstructions, extra_term = self(inputs)
 
         aeloss, log_dict_ae = self.loss(inputs, reconstructions, extra_term, 0, self.global_step,
-                                        last_layer=self.get_last_layer(), split="val")
+                                        last_layer=self.get_last_layer(), split="val", spatial_mask=spatial_mask)
         self.log("val/aeloss", aeloss, prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)        
 
         discloss, log_dict_disc = self.loss(inputs, reconstructions, extra_term, 1, self.global_step,
-                                            last_layer=self.get_last_layer(), split="val")
+                                            last_layer=self.get_last_layer(), split="val", spatial_mask=spatial_mask)
         self.log("val/discloss", discloss, prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
 
         # self.log("val/rec_loss", log_dict_ae["val/rec_loss"])
@@ -221,13 +236,6 @@ class VAEGANVQ(VAEGAN):
     def load_from_pretrained(cls, ckpt_path: str, device: str = "cpu") -> 'VAEGANVQ':
         return cls.load_from_checkpoint(ckpt_path, map_location=device, freeze_weights=True, ckpt_path=None,  loss=DummyLoss(), strict=False)
     
-    @classmethod
-    def load_from_zenodo(cls, model_flavour: str, path: Optional[str] = None, device: str = "cpu") -> 'VAEGANVQ':
-        assert model_flavour in ["vae_mae", "vae_mwae"], f"Invalid model flavour, must be one of ['vae_mae', 'vae_mwae']"
-        path = cls.default_checkpoint_path if path is None else Path(path)
-        ae_path = download_pretrained_model(model_flavour, path, overwrite=False)
-        return cls.load_from_pretrained(ae_path, device=device)
-
     def extra_ae_layers_init(self) -> list:
         self.quantize = VectorQuantizer(self.hparams.n_embed, self.hparams.embed_dim, beta=0.25)
         return [self.quantize]
@@ -289,5 +297,50 @@ class VAEGANVQ(VAEGAN):
             y = np.ma.masked_array(y, mask=mask)
         
         return y
-        
 
+    def reconstruct_swvl1(
+        self,
+        arr: Union[np.ndarray, np.ma.MaskedArray],
+        *,
+        normalized: bool = True,
+        clip: tuple[float, float] = (0.0, 0.8),
+        norm: tuple[float, float] = (-1.0, 1.0),
+    ) -> Union[np.ndarray, np.ma.MaskedArray]:
+        """Reconstruct ERA5-Land SWVL1 fields.
+
+        Args:
+            arr: Input patch or sequence with shape `(H, W)` or `(S, H, W)`.
+            normalized: If `True`, `arr` is assumed to already be in model space.
+                If `False`, `arr` is interpreted as physical SWVL1 in `m3/m3`.
+            clip: Physical clipping range used during training.
+            norm: Normalized range used during training.
+        """
+        assert arr.ndim in [2, 3], "Input must be 2D or 3D (steps, height, width)"
+
+        if isinstance(arr, np.ma.MaskedArray):
+            x = arr.data.copy()
+            mask = arr.mask.copy()
+        else:
+            x = np.asarray(arr).copy()
+            mask = None
+
+        input_dtype = arr.dtype
+
+        if not normalized:
+            x = swvl1_phys_to_norm(x, clip=clip, norm=norm)
+
+        x = x[None, None, ...] if x.ndim == 2 else x[:, None, ...]
+        x = torch.tensor(x, dtype=torch.float32).to(self.device, memory_format=torch.contiguous_format)
+
+        with torch.no_grad():
+            y, _ = self(x, auto_pad=True)
+
+        y = y.cpu().numpy().squeeze().clip(norm[0], norm[1])
+        if not normalized:
+            y = swvl1_norm_to_phys(y, clip=clip, norm=norm)
+
+        y = y.astype(input_dtype)
+        if mask is not None:
+            y = np.ma.masked_array(y, mask=mask)
+        return y
+        

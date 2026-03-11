@@ -6,8 +6,7 @@ defaults:
   - override /logger: many_loggers.yaml
   - override /trainer: gpu.yaml
 
-# Train the first-stage VAE on ERA5-Land swvl1.
-# We keep the original paper/repo structure and only swap the data source.
+# MAE baseline for SWVL1 tokenizer training.
 data:
   seq_len: 1
   stack_seq: null
@@ -18,8 +17,6 @@ data:
   max_mask_fraction: 0.40
   smart_crop_attempts: 50
   center_crop_val: False
-  # VAEGANVQ is memory-hungry; batch_size=8 can OOM on 16GB GPUs.
-  # Use 4 by default and override via CLI if you have more VRAM.
   batch_size: 4
   num_workers: 0
 
@@ -28,11 +25,10 @@ model:
   aeconfig:
     z_ch: 8
   loss:
-    pixel_loss: mwae
+    pixel_loss: l1
     pixelloss_weight: 10.0
     perceptual_weight: 0.1
 
-# Do not use mixed precision training for the VAEGAN model (same reason as original config).
 trainer:
   min_epochs: 30
   max_epochs: 100

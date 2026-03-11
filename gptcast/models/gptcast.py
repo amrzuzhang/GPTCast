@@ -5,14 +5,18 @@ from typing import Optional, Union
 from pathlib import Path
 from gptcast.models import VAEGANVQ
 from gptcast.models.components import GPT, GPTCastConfig
-from gptcast.utils.converters import dbz_to_rainfall, rainfall_to_dbz
-from gptcast.utils.downloads import download_pretrained_model
+from gptcast.utils.converters import (
+    dbz_to_rainfall,
+    rainfall_to_dbz,
+    swvl1_norm_to_phys,
+    swvl1_phys_to_norm,
+)
 import numpy as np
 import re
 from collections import OrderedDict
 
 import einops
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import math
 
     
@@ -83,14 +87,6 @@ class GPTCast(L.LightningModule):
         gptcast = cls(transformer=transformer, first_stage=first_stage).to(device).eval()
 
         return gptcast
-
-    @classmethod
-    def load_from_zenodo(cls, model_flavour: str, path: Optional[str] = None, device: str = "cpu") -> 'GPTCast':
-        assert model_flavour in ["gptcast_8", "gptcast_16"], f"Invalid model flavour, must be one of ['gptcast_8', 'gptcast_16']"
-        path = cls.default_checkpoint_path if path is None else Path(path)
-        ae_path = download_pretrained_model("vae_mwae", path, overwrite=False)
-        gpt_path = download_pretrained_model(model_flavour, path, overwrite=False)
-        return cls.load_from_pretrained(gpt_path, ae_path, device=device)
 
     def __init__(self,
                  transformer: GPT,
@@ -476,6 +472,87 @@ class GPTCast(L.LightningModule):
         if output_mask.any() or isinstance(input_sequence, np.ma.MaskedArray):
             y = np.ma.masked_array(y, mask=output_mask)
         
+        return y
+
+    @torch.no_grad()
+    def forecast_swvl1(
+        self,
+        input_sequence: Union[np.ndarray, np.ma.MaskedArray],
+        *,
+        steps: int = 1,
+        normalized: bool = True,
+        mask: Optional[np.ndarray] = None,
+        temperature: float = 1.0,
+        top_k: Optional[int] = 1,
+        verbosity: int = 1,
+        clip: tuple[float, float] = (0.0, 0.8),
+        norm: tuple[float, float] = (-1.0, 1.0),
+    ) -> Union[np.ndarray, np.ma.MaskedArray]:
+        """Forecast future ERA5-Land SWVL1 fields.
+
+        Args:
+            input_sequence: Context sequence with shape `(S, H, W)`.
+            steps: Number of forecast steps.
+            normalized: If `True`, `input_sequence` is assumed to already be in
+                model space. If `False`, values are interpreted as physical
+                SWVL1 in `m3/m3`.
+            mask: Optional static land/ocean mask with shape `(H, W)`.
+            temperature: Sampling temperature for autoregressive decoding.
+            top_k: If `1`, use greedy decoding. If `None`, sample from the full
+                token distribution.
+            verbosity: Progress verbosity passed to `predict_sequence`.
+            clip: Physical clipping range used during training.
+            norm: Normalized range used during training.
+        """
+        assert len(input_sequence.shape) == 3, "Input must have shape (steps, height, width)"
+        assert steps >= 1
+        if mask is not None:
+            assert mask.shape == input_sequence.shape[1:], "Mask shape should match the input sequence shape"
+
+        if input_sequence.shape[0] > 7:
+            input_sequence = input_sequence[-7:]
+            print("Input sequence is longer than 7 steps, only the last 7 steps are used.")
+
+        if isinstance(input_sequence, np.ma.MaskedArray):
+            x_m = input_sequence.mask
+            x = input_sequence.data
+        else:
+            x = input_sequence
+            x_m = np.zeros_like(input_sequence, dtype=bool)
+
+        input_dtype = input_sequence.dtype
+
+        if mask is not None:
+            mask = np.broadcast_to(mask, (input_sequence.shape[0], *mask.shape))
+            x_m = np.logical_or(x_m, mask)
+
+        output_mask = np.broadcast_to(x_m.sum(axis=0).astype(bool), (steps, *x_m.shape[1:]))
+
+        if not normalized:
+            x = swvl1_phys_to_norm(x, clip=clip, norm=norm)
+
+        x = torch.tensor(x, dtype=torch.float32).to(self.device)
+        x = einops.rearrange(x, 's h w -> h w s')
+
+        result = self.predict_sequence(
+            x,
+            steps=steps,
+            future=True,
+            window_size=None,
+            temperature=temperature,
+            top_k=top_k,
+            verbosity=verbosity,
+        )
+
+        y = result['pred_sequence_nopad'].cpu().numpy().squeeze().clip(norm[0], norm[1])
+        if steps == 1 and y.ndim == 2:
+            y = y[None, ...]
+        if not normalized:
+            y = swvl1_norm_to_phys(y, clip=clip, norm=norm)
+
+        y = y.astype(input_dtype)
+        if output_mask.any() or isinstance(input_sequence, np.ma.MaskedArray):
+            y = np.ma.masked_array(y, mask=output_mask)
         return y
 
     def get_input(self, key: str, batch: dict) -> torch.Tensor:

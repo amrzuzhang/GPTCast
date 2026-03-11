@@ -41,12 +41,43 @@ def l2(x, y):
     return torch.pow((x-y), 2)
 
 
-# Magnitude-Weighted Absolute Error (MWAE)
-# the idea is to give more weight to the pixels with higher values
-def mwae(x, y):
-    sx = torch.sigmoid(x)
-    sy = torch.sigmoid(y)
-    return torch.abs(sx - sy)*sx
+def _norm_to_phys_swvl1(x, clip=(0.0, 0.8), norm=(-1.0, 1.0), clamp: bool = False):
+    cmin, cmax = float(clip[0]), float(clip[1])
+    nmin, nmax = float(norm[0]), float(norm[1])
+    out = (x - nmin) / (nmax - nmin + 1e-12)
+    out = out * (cmax - cmin) + cmin
+    if clamp:
+        out = torch.clamp(out, cmin, cmax)
+    return out
+
+
+def phuber(x, y, delta=0.03, gradient_weight=0.25, range_weight=0.1):
+    """Process-aware SWVL1 loss in physical space.
+
+    - compares fields in m3/m3 instead of normalized model space
+    - uses Huber for robustness to small-scale noise
+    - adds gradient consistency to preserve spatial moisture patterns
+    - penalizes physically implausible values outside the clipping range
+    """
+    x_phys = _norm_to_phys_swvl1(x, clamp=False)
+    y_phys = _norm_to_phys_swvl1(y, clamp=False)
+
+    base = F.huber_loss(y_phys, x_phys, delta=float(delta), reduction="mean")
+
+    grad_x_true = x_phys[..., :, 1:] - x_phys[..., :, :-1]
+    grad_x_pred = y_phys[..., :, 1:] - y_phys[..., :, :-1]
+    grad_y_true = x_phys[..., 1:, :] - x_phys[..., :-1, :]
+    grad_y_pred = y_phys[..., 1:, :] - y_phys[..., :-1, :]
+    grad = 0.5 * (
+        F.huber_loss(grad_x_pred, grad_x_true, delta=float(delta), reduction="mean") +
+        F.huber_loss(grad_y_pred, grad_y_true, delta=float(delta), reduction="mean")
+    )
+
+    lower_violation = F.relu(-y_phys)
+    upper_violation = F.relu(y_phys - 0.8)
+    range_penalty = (lower_violation + upper_violation).mean()
+
+    return base + float(gradient_weight) * grad + float(range_weight) * range_penalty
 
 
 class NLayerDiscriminator(nn.Module):
@@ -111,13 +142,17 @@ class DummyLoss(nn.Module):
 class VAEGANBaseLoss(nn.Module):
     def __init__(self, disc_start, disc_num_layers=3, disc_in_channels=3,
                  disc_factor=1.0, disc_weight=1.0, disc_ndf=64, disc_loss="hinge",
-                 pixelloss_weight=1.0, pixel_loss="l1", perceptual_weight=1.0) -> None:
+                 pixelloss_weight=1.0, pixel_loss="l1", perceptual_weight=1.0,
+                 phuber_delta=0.03, grad_weight=0.25, range_weight=0.1) -> None:
         super().__init__()
         assert disc_loss in ["hinge", "vanilla"]
-        assert pixel_loss in ["l1", "l2", "mwae"]
+        assert pixel_loss in ["l1", "l2", "phuber"]
         assert perceptual_weight >= 0
         self.pixelloss_weight = pixelloss_weight
         self.perceptual_weight = perceptual_weight
+        self.phuber_delta = float(phuber_delta)
+        self.grad_weight = float(grad_weight)
+        self.range_weight = float(range_weight)
         if self.perceptual_weight > 0:
             print(f"{self.__class__.__name__}: Running with LPIPS with weight {self.perceptual_weight}.")
             self.perceptual_loss = LPIPS().eval()
@@ -126,8 +161,14 @@ class VAEGANBaseLoss(nn.Module):
             self.pixel_loss = l1
         elif pixel_loss == "l2":
             self.pixel_loss = l2
-        elif pixel_loss == "mwae":
-            self.pixel_loss = mwae
+        elif pixel_loss == "phuber":
+            self.pixel_loss = lambda x, y: phuber(
+                x,
+                y,
+                delta=self.phuber_delta,
+                gradient_weight=self.grad_weight,
+                range_weight=self.range_weight,
+            )
         else:
             raise ValueError(f"Unknown pixel loss '{pixel_loss}'.")
         print(f"{self.__class__.__name__} running with {pixel_loss} reconstruction loss.")
@@ -148,6 +189,17 @@ class VAEGANBaseLoss(nn.Module):
         self.disc_factor = disc_factor
         self.discriminator_weight = disc_weight
 
+    @staticmethod
+    def _apply_spatial_mask(inputs, reconstructions, spatial_mask=None):
+        if spatial_mask is None:
+            return inputs, reconstructions, None
+        if spatial_mask.ndim == 3:
+            spatial_mask = spatial_mask[:, None, ...]
+        invalid = spatial_mask.bool()
+        valid = (~invalid).to(dtype=inputs.dtype)
+        recon_masked = reconstructions * valid + inputs * (1.0 - valid)
+        return inputs, recon_masked, valid
+
     # calculate the adaptive weight for the discriminator loss based on the gradients of the generator and discriminator
     # the weight is calculated as the ratio of the norm of the gradients of the NLL loss and the GAN loss
     # the weight is then clamped to a certain range and multiplied by the discriminator weight
@@ -164,14 +216,22 @@ class VAEGANBaseLoss(nn.Module):
         d_weight = d_weight * self.discriminator_weight
         return d_weight
     
-    def perceptual_reconstruction_loss(self, inputs, reconstructions, split="train"):
-        rec_loss = self.pixelloss_weight * self.pixel_loss(inputs.contiguous(), reconstructions.contiguous())
+    def perceptual_reconstruction_loss(self, inputs, reconstructions, spatial_mask=None, split="train"):
+        inputs_eval, recon_eval, valid_mask = self._apply_spatial_mask(inputs, reconstructions, spatial_mask)
+        raw_rec_loss = self.pixel_loss(inputs_eval.contiguous(), recon_eval.contiguous())
+        if isinstance(raw_rec_loss, torch.Tensor) and raw_rec_loss.ndim > 0:
+            if valid_mask is not None:
+                denom = valid_mask.sum().clamp_min(1.0)
+                raw_rec_loss = (raw_rec_loss * valid_mask).sum() / denom
+            else:
+                raw_rec_loss = raw_rec_loss.mean()
+        rec_loss = self.pixelloss_weight * raw_rec_loss
         log = {
-            "{}/rec_loss".format(split): rec_loss.detach().mean()
+            "{}/rec_loss".format(split): rec_loss.detach()
         }
 
         if self.perceptual_weight > 0:
-            p_loss = self.perceptual_weight * self.perceptual_loss(inputs.contiguous(), reconstructions.contiguous())
+            p_loss = self.perceptual_weight * self.perceptual_loss(inputs_eval.contiguous(), recon_eval.contiguous())
             log["{}/p_loss".format(split)] = p_loss.detach().mean()
             prec_loss = rec_loss + p_loss
         else:
@@ -180,9 +240,10 @@ class VAEGANBaseLoss(nn.Module):
 
         return prec_loss, log
 
-    def discriminator_loss(self, inputs, reconstructions, disc_factor, split="train"):
-        logits_real = self.discriminator(inputs.contiguous().detach())
-        logits_fake = self.discriminator(reconstructions.contiguous().detach())
+    def discriminator_loss(self, inputs, reconstructions, disc_factor, spatial_mask=None, split="train"):
+        inputs_eval, recon_eval, _ = self._apply_spatial_mask(inputs, reconstructions, spatial_mask)
+        logits_real = self.discriminator(inputs_eval.contiguous().detach())
+        logits_fake = self.discriminator(recon_eval.contiguous().detach())
 
         # disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
         d_loss = disc_factor * self.disc_loss(logits_real, logits_fake)
@@ -193,8 +254,9 @@ class VAEGANBaseLoss(nn.Module):
                 }
         return d_loss, log
     
-    def generator_loss(self, nll_loss, reconstructions, disc_factor, last_layer=None, split="train"):
-        logits_fake = self.discriminator(reconstructions.contiguous())
+    def generator_loss(self, nll_loss, inputs, reconstructions, disc_factor, spatial_mask=None, last_layer=None, split="train"):
+        _, recon_eval, _ = self._apply_spatial_mask(inputs, reconstructions, spatial_mask)
+        logits_fake = self.discriminator(recon_eval.contiguous())
         g_loss = -torch.mean(logits_fake)
 
         try:
@@ -216,7 +278,7 @@ class VAEGANBaseLoss(nn.Module):
         return adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
 
     def forward(self, inputs, reconstructions, variational_term, optimizer_idx,
-                global_step, last_layer=None, split="train"):
+                global_step, last_layer=None, split="train", spatial_mask=None):
         global_log = {}
 
         disc_factor = self.compute_disc_factor(global_step)
@@ -224,13 +286,13 @@ class VAEGANBaseLoss(nn.Module):
 
         # now the GAN part
         if optimizer_idx == 0:
-            rec_loss, log = self.perceptual_reconstruction_loss(inputs, reconstructions, split=split)
+            rec_loss, log = self.perceptual_reconstruction_loss(inputs, reconstructions, spatial_mask=spatial_mask, split=split)
             global_log.update(log)
 
             nll_loss, log = self.nll_loss(rec_loss, split=split)
             global_log.update(log)
 
-            gen_loss, log = self.generator_loss(nll_loss, reconstructions, disc_factor, last_layer=last_layer, split=split)
+            gen_loss, log = self.generator_loss(nll_loss, inputs, reconstructions, disc_factor, spatial_mask=spatial_mask, last_layer=last_layer, split=split)
             global_log.update(log)
 
             variational_loss, log = self.variational_loss(variational_term, split=split)
@@ -243,7 +305,7 @@ class VAEGANBaseLoss(nn.Module):
 
         if optimizer_idx == 1:
             # second pass for discriminator update
-            d_loss, log = self.discriminator_loss(inputs, reconstructions, disc_factor, split=split)
+            d_loss, log = self.discriminator_loss(inputs, reconstructions, disc_factor, spatial_mask=spatial_mask, split=split)
             global_log.update(log)
             return d_loss, global_log
     
