@@ -188,6 +188,43 @@ python gptcast/train.py trainer=gpu experiment=vae_phuber_swvl1 \
   data.batch_size=2 data.num_workers=0
 ```
 
+Recommended A800 80G commands (server):
+
+```bash
+# connect from local terminal
+ssh user@server
+
+cd /path/to/GPTCast
+export PROJECT_ROOT="$PWD"
+```
+
+```bash
+# Stage 1A: MAE tokenizer
+python gptcast/train.py \
+  experiment=vae_mae_swvl1 \
+  test=False \
+  data.batch_size=8 \
+  data.num_workers=8 \
+  data.pin_memory=true \
+  data.center_crop_val=true \
+  model.base_learning_rate=2.25e-6
+```
+
+```bash
+# Stage 1B: PHuber tokenizer
+python gptcast/train.py \
+  experiment=vae_phuber_swvl1 \
+  test=False \
+  data.batch_size=8 \
+  data.num_workers=8 \
+  data.pin_memory=true \
+  data.center_crop_val=true \
+  model.base_learning_rate=2.25e-6
+```
+
+Reason: the code scales effective learning rate with batch size, so these
+commands keep the original default effective LR while using a larger A800-friendly batch.
+
 ### Train GPTCast
 After training the VAE, train the GPTCast model with one of the following configurations contained in the folder [configs/experiment/](configs/experiment/):
 - [gptcast_8x8](configs/experiment/gptcast_8x8.yaml) - 8x8 token spatial context (128x128 pixels)
@@ -213,6 +250,34 @@ python gptcast/train.py trainer=gpu experiment=gptcast_16x16_era5land_swvl1 \
   data.batch_size=2 data.num_workers=0
 ```
 
+Recommended A800 80G command (server):
+
+```bash
+# pick the newest first-stage checkpoint on the server
+FIRST_STAGE_CKPT=$(find logs/train/runs -path '*/checkpoints/*.ckpt' -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)
+echo "$FIRST_STAGE_CKPT"
+```
+
+```bash
+# Stage 2: GPT forecaster
+python gptcast/train.py \
+  experiment=gptcast_16x16_era5land_swvl1 \
+  model.first_stage.ckpt_path="$FIRST_STAGE_CKPT" \
+  test=False \
+  data.batch_size=8 \
+  data.num_workers=8 \
+  data.pin_memory=true \
+  data.center_crop_val=true \
+  model.base_learning_rate=2.8125e-6
+```
+
+If you prefer a larger batch on the same GPU:
+
+```bash
+# use batch_size=10 and keep effective LR unchanged
+data.batch_size=10 model.base_learning_rate=2.25e-6
+```
+
 Practical note: the provided inference utilities in `gptcast/models/gptcast.py` are designed for a maximum context length of **7 steps** (with `block_size=2048`), even though training uses 8 stacked frames.
 
 ## TensorBoard
@@ -223,33 +288,17 @@ Each Hydra run writes TensorBoard logs under:
 logs/train/runs/<timestamp>/tensorboard/
 ```
 
-Launch TensorBoard locally for all local runs:
+To open TensorBoard for the newest run automatically:
 
 ```bash
-tensorboard --logdir /home/ang/GPTCast/logs/train --port 6006
+# on server
+cd /path/to/GPTCast
+LATEST_RUN=$(ls -td logs/train/runs/* | head -n 1)
+echo "$LATEST_RUN"
+tensorboard --logdir "$LATEST_RUN/tensorboard" --port 6006
 ```
 
-To compare a local run with a server run, first sync only the TensorBoard logs
-(not the dataset) from the server:
-
-```bash
-mkdir -p /home/ang/GPTCast/logs_remote
-
-rsync -avz \
-  user@server:/path/to/GPTCast/logs/train/runs/2026-03-11_17-28-06/tensorboard/ \
-  /home/ang/GPTCast/logs_remote/server_vae_phuber_swvl1/
-```
-
-Then launch TensorBoard with named log roots:
-
-```bash
-tensorboard --logdir_spec \
-local:/home/ang/GPTCast/logs/train,\
-server:/home/ang/GPTCast/logs_remote \
---port 6006
-```
-
-If you prefer not to copy logs, run TensorBoard on the server and forward the port:
+To view TensorBoard for a run that is training on the server, start TensorBoard on the server:
 
 ```bash
 # on server
@@ -257,12 +306,14 @@ cd /path/to/GPTCast
 tensorboard --logdir logs/train --port 6006
 ```
 
+Then forward the port from your local terminal:
+
 ```bash
 # on local machine
 ssh -L 6006:localhost:6006 user@server
 ```
 
-Open:
+Finally open TensorBoard in your local browser:
 
 ```text
 http://localhost:6006
