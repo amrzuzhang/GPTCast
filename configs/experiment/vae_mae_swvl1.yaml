@@ -1,0 +1,36 @@
+# @package _global_
+
+defaults:
+  - override /data: era5land_swvl1.yaml
+  - override /model: vaeganvq.yaml
+  - override /logger: many_loggers.yaml
+  - override /trainer: gpu.yaml
+
+# MAE baseline for SWVL1 tokenizer training.
+data:
+  seq_len: 1
+  stack_seq: null
+  resize: 720
+  crop: 256
+  random_rotate90: False
+  smart_crop: True
+  max_mask_fraction: 0.40
+  smart_crop_attempts: 50
+  center_crop_val: False
+  batch_size: 4
+  num_workers: 0
+
+model:
+  embed_dim: 8
+  aeconfig:
+    z_ch: 8
+  loss:
+    pixel_loss: l1
+    pixelloss_weight: 10.0
+    perceptual_weight: 0.1
+
+trainer:
+  min_epochs: 30
+  max_epochs: 100
+
+seed: 42

@@ -1,0 +1,50 @@
+_target_: gptcast.data.era5land_swvl1_datamodule.Era5LandSwvl1DataModule
+
+# ERA5-Land layout (user-provided):
+#   ${paths.data_dir}/0.1/1/land_surface/<year>/volumetric_soil_water_layer_1.nc
+base_dir: ${paths.data_dir}0.1/1/land_surface
+
+# Explicit time splits (no temporal leakage).
+#
+# We use the yearly CSV variants by default (one row per year, MIARAD-style),
+# which are easier to inspect/edit than huge multi-year segments.
+#
+# Note: ERA5-Land `swvl1` timestamps are *not* perfectly uniform across the full
+# record (e.g., 2018-12 shifts from 11:30 to 10:30; 1979-1980 uses 11:00; 2019+
+# returns to 11:00). The dataset implementation filters `seq_len>1` windows to
+# ensure all steps are spaced by exactly 1 day, so windows never straddle a
+# discontinuity even with yearly CSVs.
+#
+# If you prefer fully pre-split metadata, the *_segments.csv files are also
+# available under ${paths.data_dir}0.1/.
+train_metadata_path_or_df: ${paths.data_dir}0.1/era5land_swvl1_train.csv
+val_metadata_path_or_df: ${paths.data_dir}0.1/era5land_swvl1_val.csv
+test_metadata_path_or_df: ${paths.data_dir}0.1/era5land_swvl1_test.csv
+
+# swvl1 is in m^3/m^3 and is ~[0, 0.8] on land.
+# We scale to [-1, 1] to reuse the original GPTCast/VAE config assumptions.
+clip_and_normalize: [0.0, 0.8, -1.0, 1.0]
+
+# Important: swvl1 has a static ocean mask (~65% of pixels on the native grid).
+# To avoid the model spending most capacity reconstructing constant ocean pixels, we:
+# 1) upsample to a larger canvas
+# 2) crop 256x256 patches (paper-style)
+# 3) optionally pick the best crop among a few tries (low ocean fraction)
+#
+# This keeps the *model* configs unchanged while making the training distribution more land-focused.
+resize: 720
+crop: 256
+random_rotate90: False
+smart_crop: True
+max_mask_fraction: 0.40
+smart_crop_attempts: 50
+center_crop_val: False
+
+seq_len: 1
+stack_seq: null
+drop_incomplete: True
+max_open_years: 4
+
+batch_size: 8
+num_workers: 0
+pin_memory: True

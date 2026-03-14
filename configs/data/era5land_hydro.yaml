@@ -1,0 +1,35 @@
+_target_: gptcast.data.era5land_hydro_datamodule.Era5LandHydroDataModule
+
+# Generic ERA5-Land hydro layout rooted at ${paths.data_dir}0.1/1
+base_dir: ${paths.data_dir}0.1/1
+
+train_metadata_path_or_df: ${paths.data_dir}0.1/era5land_swvl1_train.csv
+val_metadata_path_or_df: ${paths.data_dir}0.1/era5land_swvl1_val.csv
+test_metadata_path_or_df: ${paths.data_dir}0.1/era5land_swvl1_test.csv
+
+# Main target / state field. Examples: swvl1, rzsm_0_100cm, soil_water_storage_0_100cm_mm
+image_variable_key: swvl1
+
+# Optional forcing variables returned as `forcing` with channels = len(vars) * seq_len.
+forcing_variable_keys: []
+normalize_forcing: false
+
+# For the main image variable only. If null, the variable registry default is used.
+clip_and_normalize: null
+
+resize: 720
+crop: 256
+random_rotate90: False
+smart_crop: True
+max_mask_fraction: 0.40
+smart_crop_attempts: 50
+center_crop_val: False
+
+seq_len: 1
+stack_seq: null
+drop_incomplete: True
+max_open_years: 8
+
+batch_size: 8
+num_workers: 0
+pin_memory: True

@@ -1,0 +1,41 @@
+# @package _global_
+
+defaults:
+  - override /data: era5land_hydro.yaml
+  - override /model: vaeganvq.yaml
+  - override /logger: many_loggers.yaml
+  - override /trainer: gpu.yaml
+
+# Root-zone tokenizer with physically-informed reconstruction.
+data:
+  image_variable_key: rzsm_0_100cm
+  clip_and_normalize: [0.0, 0.8, -1.0, 1.0]
+  seq_len: 1
+  stack_seq: null
+  resize: 720
+  crop: 256
+  random_rotate90: False
+  smart_crop: True
+  max_mask_fraction: 0.40
+  smart_crop_attempts: 50
+  center_crop_val: False
+  batch_size: 4
+  num_workers: 0
+
+model:
+  embed_dim: 8
+  aeconfig:
+    z_ch: 8
+  loss:
+    pixel_loss: phuber
+    pixelloss_weight: 10.0
+    perceptual_weight: 0.1
+    phuber_delta: 0.03
+    grad_weight: 0.25
+    range_weight: 0.10
+
+trainer:
+  min_epochs: 30
+  max_epochs: 100
+
+seed: 42
