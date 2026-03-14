@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /data: era5land_swvl1.yaml
+  - override /data: era5land_hydro.yaml
   - override /model: gptcast.yaml
   - override /logger: many_loggers.yaml
   - override /trainer: gpu.yaml
@@ -10,15 +10,28 @@ model:
   log_physical_metrics: true
   physical_metric_context_steps: 7
 
+  cond_stage_key: forcing
+  use_forcing_conditioning: true
+  forcing_channels: 40
+  forcing_n_cond_tokens: 8
+  forcing_hidden_channels: 128
+
   transformer:
-    # 8 stacked 256x256 frames (vertical stacking) -> 2048 tokens with patch_size=16.
-    block_size: 2048
+    block_size: 2304
 
   first_stage:
     ckpt_path: "SET_A_VALID_CHECKPOINT_PATH_FOR_THE_FIRST_STAGE_MODEL_HERE"
 
-# Paper-style stacked input: 8 daily frames stacked vertically into a single-channel big image.
 data:
+  image_variable_key: swvl1
+  forcing_variable_keys:
+    - precipitation
+    - evapotranspiration
+    - runoff
+    - 2m_temperature
+    - surface_solar_radiation_downwards_w_m2
+  normalize_forcing: true
+  clip_and_normalize: [0.0, 0.8, -1.0, 1.0]
   seq_len: 8
   stack_seq: v
   resize: 720
@@ -42,7 +55,6 @@ callbacks:
     save_last: True
 
 trainer:
-  # bf16 is ok for the transformer forecaster (same as original config).
   precision: bf16-true
   min_epochs: 30
   max_epochs: 100

@@ -1,2 +1,3 @@
 from .miarad_datamodule import MiaradDataModule
 from .era5land_swvl1_datamodule import Era5LandSwvl1DataModule
+from .era5land_hydro_datamodule import Era5LandHydroDataModule

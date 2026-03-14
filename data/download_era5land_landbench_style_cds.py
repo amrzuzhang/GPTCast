@@ -41,6 +41,8 @@ Notes
 - This is *not* changing model/training code. It's a standalone downloader/preprocessor.
 - To keep dataset size manageable, we download ONE fixed time per day (default: 12:00).
   That yields ~365 frames/year, compatible with the existing SWVL1 daily layout.
+- Requests are submitted **year-by-year** to reduce the number of CDS jobs and
+  avoid the overhead of one request per month.
 - ERA5-Land `total_precipitation` (tp) is meters accumulated over the hour in the NetCDF output.
   We store it as a rate in m/hr (numerically identical for a 1-hour accumulation).
 - ERA5-Land `ssrd/strd` are J/m^2 accumulated over the hour; we convert to W/m^2 by /3600.
@@ -215,6 +217,31 @@ def _download_month(
     client.retrieve(dataset, req, str(out_path))
 
 
+def _download_year(
+    *,
+    client,
+    dataset: str,
+    var_requests: Sequence[str],
+    year: int,
+    time: str,
+    area_list: Sequence[float],
+    out_path: Path,
+) -> None:
+    req = {
+        "product_type": "reanalysis",
+        "variable": list(var_requests),
+        "year": str(year),
+        "month": [f"{m:02d}" for m in range(1, 13)],
+        "day": [f"{d:02d}" for d in range(1, 32)],
+        "time": time,
+        "area": list(area_list),
+        "format": "netcdf",
+    }
+
+    print(f"[download] year={year} vars={len(var_requests)} -> {out_path.name}")
+    client.retrieve(dataset, req, str(out_path))
+
+
 def _is_likely_transient_download_error(exc: Exception) -> bool:
     current = exc
     seen: set[int] = set()
@@ -243,6 +270,19 @@ def _is_likely_transient_download_error(exc: Exception) -> bool:
     return False
 
 
+def _retry_sleep_duration(
+    *,
+    attempt: int,
+    retry_sleep_seconds: float,
+    retry_backoff: float,
+    retry_jitter_seconds: float,
+) -> float:
+    sleep_s = float(retry_sleep_seconds) * (float(retry_backoff) ** max(0, attempt - 1))
+    if float(retry_jitter_seconds) > 0:
+        sleep_s += random.uniform(0.0, float(retry_jitter_seconds))
+    return max(0.0, sleep_s)
+
+
 def _ensure_month_ok_or_redownload(
     *,
     client,
@@ -258,7 +298,7 @@ def _ensure_month_ok_or_redownload(
     max_attempts: int = 3,
     retry_sleep_seconds: float = 5.0,
     retry_backoff: float = 2.0,
-    retry_jitter_seconds: float = 1.0,
+    retry_jitter_seconds: float = 0.0,
 ) -> None:
     """Validate or (re)download a monthly file (handles partial/corrupt leftovers)."""
 
@@ -280,6 +320,7 @@ def _ensure_month_ok_or_redownload(
                     pass
 
         try:
+            started_at = time_module.monotonic()
             active_client = client_factory() if client_factory is not None else client
             _download_month(
                 client=active_client,
@@ -295,24 +336,107 @@ def _ensure_month_ok_or_redownload(
             return
         except Exception as e:
             last_err = e
+            elapsed_s = time_module.monotonic() - started_at
             print(
                 f"[warn] year={year} month={month:02d} download/convert failed "
-                f"(attempt {attempt}/{max_attempts}): {type(e).__name__}: {e}"
+                f"(attempt {attempt}/{max_attempts}, request_elapsed={elapsed_s:.1f}s): "
+                f"{type(e).__name__}: {e}"
             )
             try:
                 month_path.unlink()
             except FileNotFoundError:
                 pass
             if attempt < int(max_attempts) and _is_likely_transient_download_error(e):
-                sleep_s = float(retry_sleep_seconds) * (float(retry_backoff) ** (attempt - 1))
-                sleep_s += random.uniform(0.0, float(retry_jitter_seconds))
-                print(
-                    f"[retry] year={year} month={month:02d} sleeping {sleep_s:.1f}s before retry"
+                sleep_s = _retry_sleep_duration(
+                    attempt=attempt,
+                    retry_sleep_seconds=retry_sleep_seconds,
+                    retry_backoff=retry_backoff,
+                    retry_jitter_seconds=retry_jitter_seconds,
                 )
-                time_module.sleep(max(0.0, sleep_s))
+                print(
+                    f"[retry] year={year} month={month:02d} extra_sleep={sleep_s:.1f}s before retry"
+                )
+                time_module.sleep(sleep_s)
 
     raise RuntimeError(
         f"Failed to obtain a valid monthly file after {max_attempts} attempts: {month_path}\n"
+        f"Last error: {type(last_err).__name__}: {last_err}"
+    )
+
+
+def _ensure_year_ok_or_redownload(
+    *,
+    client,
+    client_factory=None,
+    dataset: str,
+    var_requests: Sequence[str],
+    year: int,
+    time: str,
+    area_list: Sequence[float],
+    year_path: Path,
+    overwrite: bool,
+    max_attempts: int = 3,
+    retry_sleep_seconds: float = 5.0,
+    retry_backoff: float = 2.0,
+    retry_jitter_seconds: float = 0.0,
+) -> None:
+    """Validate or (re)download one yearly file."""
+
+    last_err: Exception | None = None
+    for attempt in range(1, int(max_attempts) + 1):
+        if year_path.exists() and not overwrite:
+            try:
+                _ensure_netcdf_inplace(year_path)
+                return
+            except Exception as e:
+                last_err = e
+                print(
+                    f"[warn] year={year} existing file invalid "
+                    f"(attempt {attempt}/{max_attempts}): {type(e).__name__}: {e}"
+                )
+                try:
+                    year_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+        try:
+            started_at = time_module.monotonic()
+            active_client = client_factory() if client_factory is not None else client
+            _download_year(
+                client=active_client,
+                dataset=dataset,
+                var_requests=var_requests,
+                year=year,
+                time=time,
+                area_list=area_list,
+                out_path=year_path,
+            )
+            _ensure_netcdf_inplace(year_path)
+            return
+        except Exception as e:
+            last_err = e
+            elapsed_s = time_module.monotonic() - started_at
+            print(
+                f"[warn] year={year} download/convert failed "
+                f"(attempt {attempt}/{max_attempts}, request_elapsed={elapsed_s:.1f}s): "
+                f"{type(e).__name__}: {e}"
+            )
+            try:
+                year_path.unlink()
+            except FileNotFoundError:
+                pass
+            if attempt < int(max_attempts) and _is_likely_transient_download_error(e):
+                sleep_s = _retry_sleep_duration(
+                    attempt=attempt,
+                    retry_sleep_seconds=retry_sleep_seconds,
+                    retry_backoff=retry_backoff,
+                    retry_jitter_seconds=retry_jitter_seconds,
+                )
+                print(f"[retry] year={year} extra_sleep={sleep_s:.1f}s before retry")
+                time_module.sleep(sleep_s)
+
+    raise RuntimeError(
+        f"Failed to obtain a valid yearly file after {max_attempts} attempts: {year_path}\n"
         f"Last error: {type(last_err).__name__}: {last_err}"
     )
 
@@ -696,30 +820,25 @@ def _download_one_year(
 
     tmp_dir = out_root / "_tmp_landbench_style" / str(year)
     tmp_dir.mkdir(parents=True, exist_ok=True)
+    year_path = tmp_dir / f"forcing_{year}.nc"
 
-    month_paths: list[Path] = []
-    for month in range(1, 13):
-        m = _month_str(month)
-        month_path = tmp_dir / f"forcing_{year}{m}.nc"
-        month_paths.append(month_path)
-        _ensure_month_ok_or_redownload(
-            client=client,
-            client_factory=client_factory,
-            dataset=dataset,
-            var_requests=raw_vars,
-            year=year,
-            month=month,
-            time=time,
-            area_list=area_list,
-            month_path=month_path,
-            overwrite=overwrite,
-            max_attempts=max_download_attempts,
-            retry_sleep_seconds=retry_sleep_seconds,
-            retry_backoff=retry_backoff,
-            retry_jitter_seconds=retry_jitter_seconds,
-        )
+    _ensure_year_ok_or_redownload(
+        client=client,
+        client_factory=client_factory,
+        dataset=dataset,
+        var_requests=raw_vars,
+        year=year,
+        time=time,
+        area_list=area_list,
+        year_path=year_path,
+        overwrite=overwrite,
+        max_attempts=max_download_attempts,
+        retry_sleep_seconds=retry_sleep_seconds,
+        retry_backoff=retry_backoff,
+        retry_jitter_seconds=retry_jitter_seconds,
+    )
 
-    year_ds, opened = _concat_months_to_year(month_paths=month_paths, raw_to_internal=raw_to_internal)
+    year_ds, opened = _concat_months_to_year(month_paths=[year_path], raw_to_internal=raw_to_internal)
     try:
         for spec in out_specs:
             out_path = out_root / spec.category / str(year) / spec.filename
@@ -745,11 +864,10 @@ def _download_one_year(
                 pass
 
     if not keep_monthly:
-        for p in month_paths:
-            try:
-                p.unlink()
-            except FileNotFoundError:
-                pass
+        try:
+            year_path.unlink()
+        except FileNotFoundError:
+            pass
         try:
             tmp_dir.rmdir()
         except OSError:
@@ -821,7 +939,7 @@ def download_era5land_landbench_style(
     max_download_attempts: int = 8,
     retry_sleep_seconds: float = 5.0,
     retry_backoff: float = 2.0,
-    retry_jitter_seconds: float = 1.0,
+    retry_jitter_seconds: float = 0.0,
 ) -> None:
     """Download ERA5-Land vars and write LandBench-like yearly files.
 
@@ -840,6 +958,7 @@ def download_era5land_landbench_style(
             Exponential backoff multiplier applied to each retry sleep.
         retry_jitter_seconds:
             Extra random jitter added to retry sleep to avoid retry storms.
+            Defaults to 0 for more predictable timing.
     """
 
     _require("cdsapi")
@@ -1007,7 +1126,7 @@ def main() -> None:
     parser.add_argument("--max-download-attempts", type=int, default=8)
     parser.add_argument("--retry-sleep-seconds", type=float, default=5.0)
     parser.add_argument("--retry-backoff", type=float, default=2.0)
-    parser.add_argument("--retry-jitter-seconds", type=float, default=1.0)
+    parser.add_argument("--retry-jitter-seconds", type=float, default=0.0)
     args = parser.parse_args()
 
     years = _parse_int_list(args.years)

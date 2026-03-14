@@ -35,6 +35,17 @@ from gptcast.utils import pylogger
 log = pylogger.get_pylogger(__name__)
 
 
+def _get_best_ckpt_path(trainer: Trainer) -> Optional[str]:
+    ckpt_callback = getattr(trainer, "checkpoint_callback", None)
+    if ckpt_callback is None:
+        return None
+
+    best_path = getattr(ckpt_callback, "best_model_path", "")
+    if best_path is None or str(best_path).strip() == "":
+        return None
+    return str(best_path)
+
+
 @task_wrapper
 def train(cfg: DictConfig) -> Tuple[dict, dict]:
     """Trains the model. Can additionally evaluate on a testset, using best weights obtained during
@@ -95,11 +106,12 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
 
     train_metrics = trainer.callback_metrics
+    best_ckpt_path = _get_best_ckpt_path(trainer)
 
     if cfg.get("test"):
         log.info("Starting testing!")
-        ckpt_path = trainer.checkpoint_callback.best_model_path
-        if ckpt_path == "":
+        ckpt_path = best_ckpt_path
+        if ckpt_path is None:
             log.warning("Best ckpt not found! Using current weights for testing...")
             ckpt_path = None
         trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
@@ -109,6 +121,7 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
 
     # merge train and test metrics
     metric_dict = {**train_metrics, **test_metrics}
+    object_dict["best_ckpt_path"] = best_ckpt_path
 
     return metric_dict, object_dict
 
@@ -120,12 +133,15 @@ def main(cfg: DictConfig) -> Optional[float]:
     extras(cfg)
 
     # train the model
-    metric_dict, _ = train(cfg)
+    metric_dict, object_dict = train(cfg)
 
     # safely retrieve metric value for hydra-based hyperparameter optimization
     metric_value = utils.get_metric_value(
         metric_dict=metric_dict, metric_name=cfg.get("optimized_metric")
     )
+
+    best_ckpt_path = object_dict.get("best_ckpt_path")
+    print(f"最佳的ckpt是：{best_ckpt_path if best_ckpt_path else '<none>'}")
 
     # return optimized metric
     return metric_value

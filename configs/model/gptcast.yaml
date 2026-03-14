@@ -1,5 +1,10 @@
 _target_: gptcast.models.GPTCast
 base_learning_rate: 4.5e-6
+cond_stage_key: image
+use_forcing_conditioning: false
+forcing_channels: 0
+forcing_n_cond_tokens: 4
+forcing_hidden_channels: 128
 
 transformer:
   _target_: gptcast.models.components.GPT

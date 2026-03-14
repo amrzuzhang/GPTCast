@@ -50,6 +50,34 @@ class SOSProvider(AbstractEncoder):
         return c
 
 
+class ForcingContextEncoder(torch.nn.Module):
+    """Encode continuous forcing fields into a small prefix of GPT embeddings."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        n_embd: int,
+        n_cond_tokens: int = 4,
+        hidden_channels: int = 128,
+    ):
+        super().__init__()
+        self.n_cond_tokens = int(n_cond_tokens)
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=2, padding=1),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=2, padding=1),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(hidden_channels, n_embd, kernel_size=1),
+            torch.nn.GELU(),
+        )
+        self.pool = torch.nn.AdaptiveAvgPool2d((self.n_cond_tokens, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.encoder(x)
+        h = self.pool(h).squeeze(-1).transpose(1, 2).contiguous()  # (B, Tcond, Cemb)
+        return h
+
+
 class GPTCast(L.LightningModule):
     default_checkpoint_path = Path(__file__).parent.parent.parent.resolve() / "models"
 
@@ -95,25 +123,46 @@ class GPTCast(L.LightningModule):
                  ckpt_path: str = None,
                  ignore_keys: list = [],
                  first_stage_key: str = "image",
+                 cond_stage_key: Optional[str] = None,
+                 use_forcing_conditioning: bool = False,
+                 forcing_channels: int = 0,
+                 forcing_n_cond_tokens: int = 4,
+                 forcing_hidden_channels: int = 128,
                  pkeep: float = 1.0,
                  sos_token: int = 0,
                  base_learning_rate: float = 1e-4,
+                 log_physical_metrics: bool = False,
+                 physical_metric_context_steps: Optional[int] = None,
                  ):
         super().__init__()
         self.save_hyperparameters(logger=False, ignore=['first_stage', 'transformer']) #, 'permuter'])
         self.base_learning_rate = base_learning_rate
         self.sos_token = sos_token
         self.first_stage_key = first_stage_key
+        self.use_forcing_conditioning = bool(use_forcing_conditioning)
 
         self.first_stage_model = first_stage
         assert(self.first_stage_model.hparams.freeze_weights)
         self.first_stage_model.eval()
         self.first_stage_model.train = disabled_train
 
-        # force unconditional training
-        self.be_unconditional = True
-        self.cond_stage_key = self.first_stage_key
-        self.cond_stage_model = SOSProvider(self.sos_token)
+        if self.use_forcing_conditioning:
+            if int(forcing_channels) < 1:
+                raise ValueError("forcing_channels must be >= 1 when use_forcing_conditioning=True")
+            self.be_unconditional = False
+            self.cond_stage_key = cond_stage_key or "forcing"
+            self.cond_stage_model = None
+            self.forcing_context_encoder = ForcingContextEncoder(
+                in_channels=int(forcing_channels),
+                n_embd=int(transformer.config.n_embd),
+                n_cond_tokens=int(forcing_n_cond_tokens),
+                hidden_channels=int(forcing_hidden_channels),
+            )
+        else:
+            # force unconditional training
+            self.be_unconditional = True
+            self.cond_stage_key = self.first_stage_key if cond_stage_key is None else cond_stage_key
+            self.cond_stage_model = SOSProvider(self.sos_token)
 
         # self.permuter = Identity() if permuter is None else permuter
 
@@ -124,9 +173,11 @@ class GPTCast(L.LightningModule):
 
         self.pkeep = pkeep
 
-    def init_from_ckpt(self, path, ignore_keys=list()):
+    def init_from_ckpt(self, path, ignore_keys=None):
+        if ignore_keys is None:
+            ignore_keys = []
         sd = torch.load(path, map_location="cpu")["state_dict"]
-        for k in sd.keys():
+        for k in list(sd.keys()):
             for ik in ignore_keys:
                 if k.startswith(ik):
                     self.print("Deleting key {} from state_dict.".format(k))
@@ -134,10 +185,59 @@ class GPTCast(L.LightningModule):
         self.load_state_dict(sd, strict=False)
         print(f"Restored from {path}")
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # one step to produce the logits
-        _, z_indices = self.encode_to_z(x)
-        _, c_indices = self.encode_to_c(c)
+    @staticmethod
+    def _norm_to_phys(x: torch.Tensor, clip: tuple[float, float], norm: tuple[float, float]) -> torch.Tensor:
+        cmin, cmax = float(clip[0]), float(clip[1])
+        nmin, nmax = float(norm[0]), float(norm[1])
+        out = (x - nmin) / (nmax - nmin + 1e-12)
+        out = out * (cmax - cmin) + cmin
+        return out
+
+    @staticmethod
+    def _split_stacked_sequence(x: torch.Tensor, seq_len: int, stack_seq: Optional[str]) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"Expected a 4D BCHW tensor, got shape {tuple(x.shape)}")
+
+        if stack_seq is None:
+            if x.shape[1] == seq_len:
+                return x
+            if seq_len == 1 and x.shape[1] == 1:
+                return x
+            raise ValueError(
+                f"Cannot split unstacked sequence with shape {tuple(x.shape)} for seq_len={seq_len}"
+            )
+
+        if x.shape[1] != 1:
+            raise ValueError(
+                f"Expected a single-channel stacked tensor for stack_seq={stack_seq!r}, got shape {tuple(x.shape)}"
+            )
+
+        bsz, _, height, width = x.shape
+        if stack_seq == "v":
+            if height % seq_len != 0:
+                raise ValueError(f"Height {height} is not divisible by seq_len={seq_len}")
+            frame_h = height // seq_len
+            return x[:, 0].reshape(bsz, seq_len, frame_h, width)
+        if stack_seq == "h":
+            if width % seq_len != 0:
+                raise ValueError(f"Width {width} is not divisible by seq_len={seq_len}")
+            frame_w = width // seq_len
+            return x[:, 0].reshape(bsz, height, seq_len, frame_w).permute(0, 2, 1, 3).contiguous()
+
+        raise ValueError(f"Unsupported stack_seq={stack_seq!r}")
+
+    def _teacher_forced_outputs(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Size]:
+        quant_z, z_indices = self.encode_to_z(x)
+        cond_embeddings = None
+        c_indices = None
+        if self.use_forcing_conditioning:
+            cond_embeddings = self.encode_forcing(c)
+        else:
+            _, c_indices = self.encode_to_c(c)
 
         if self.training and self.pkeep < 1.0:
             mask = torch.bernoulli(self.pkeep*torch.ones(z_indices.shape, device=z_indices.device))
@@ -147,16 +247,21 @@ class GPTCast(L.LightningModule):
         else:
             a_indices = z_indices
 
-        cz_indices = torch.cat((c_indices, a_indices), dim=1)
-
         # target includes all sequence elements (no need to handle first one
         # differently because we are conditioning)
         target = z_indices
-        # make the prediction
-        logits, _ = self.transformer(cz_indices[:, :-1])
-        # cut off conditioning outputs - output i corresponds to p(z_i | z_{<i}, c)
-        logits = logits[:, c_indices.shape[1]-1:]
+        if self.use_forcing_conditioning:
+            logits, _ = self.transformer(a_indices[:, :-1], embeddings=cond_embeddings)
+            logits = logits[:, cond_embeddings.shape[1] - 1:]
+        else:
+            cz_indices = torch.cat((c_indices, a_indices), dim=1)
+            logits, _ = self.transformer(cz_indices[:, :-1])
+            logits = logits[:, c_indices.shape[1]-1:]
 
+        return logits, target, quant_z.shape
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logits, target, _ = self._teacher_forced_outputs(x, c)
         return logits, target
 
     def top_k_logits(self, logits: torch.Tensor, k: int) -> torch.Tensor:
@@ -182,6 +287,12 @@ class GPTCast(L.LightningModule):
         return quant_c, indices
 
     @torch.no_grad()
+    def encode_forcing(self, c: torch.Tensor) -> torch.Tensor:
+        if not self.use_forcing_conditioning:
+            raise RuntimeError("encode_forcing called but use_forcing_conditioning=False")
+        return self.forcing_context_encoder(c)
+
+    @torch.no_grad()
     def decode_to_img(self, index: torch.Tensor, zshape: torch.Size) -> torch.Tensor:
         # index = self.permuter(index, reverse=True)
         bhwc = (zshape[0],zshape[2],zshape[3],zshape[1])
@@ -191,9 +302,15 @@ class GPTCast(L.LightningModule):
         return x
 
     @torch.no_grad()
-    def predict_next_index(self, context: torch.Tensor, temperature: float = 1., top_k: Optional[int] = None) -> torch.Tensor:
+    def predict_next_index(
+        self,
+        context: torch.Tensor,
+        temperature: float = 1.,
+        top_k: Optional[int] = None,
+        cond_embeddings: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         assert context.ndim == 2
-        logits, _ = self.transformer(context)
+        logits, _ = self.transformer(context, embeddings=cond_embeddings)
         # we just need the prediction for the last token
         logits = logits[:, -1, :] / temperature
         if top_k is not None:
@@ -213,12 +330,13 @@ class GPTCast(L.LightningModule):
     def predict_next_frame_indices(
         self,
         input_indices: torch.Tensor,
-        c_indices: torch.Tensor,
+        c_indices: Optional[torch.Tensor],
         window_size: int,
         temperature: float = 1.,
         top_k: Optional[int] = None,
         show_progress: bool = True,
-        pbar_position: int = 0
+        pbar_position: int = 0,
+        cond_embeddings: Optional[torch.Tensor] = None,
         ):
         idx_batch, idx_step, idx_h, idx_w = input_indices.shape  # b s h w
 
@@ -248,8 +366,6 @@ class GPTCast(L.LightningModule):
                 # print(
                 #     f"rows: {i_start}-{i_end}, cols: {j_start}-{j_end}, abs_target_pos: {i}-{j}, local_target_pos: {local_i}-{local_j}")
 
-                conditioning = c_indices.reshape(c_indices.shape[0], -1)
-
                 past_patches = input_indices[:, :, i_start:i_end, j_start:j_end]
                 past_tokens = past_patches.reshape(past_patches.shape[0], -1)
 
@@ -257,8 +373,12 @@ class GPTCast(L.LightningModule):
                 predicted_tokens = predicted_patch.reshape(predicted_patch.shape[0], -1)[:,
                                 :local_i * predicted_patch.shape[1] + local_j]
 
-                full_context = torch.cat((conditioning, past_tokens, predicted_tokens), dim=1)
-                res = self.predict_next_index(full_context, temperature, top_k)
+                if c_indices is not None:
+                    conditioning = c_indices.reshape(c_indices.shape[0], -1)
+                    full_context = torch.cat((conditioning, past_tokens, predicted_tokens), dim=1)
+                else:
+                    full_context = torch.cat((past_tokens, predicted_tokens), dim=1)
+                res = self.predict_next_index(full_context, temperature, top_k, cond_embeddings=cond_embeddings)
                 predicted_indices[:, i, j] = res
 
                 if show_progress:
@@ -274,6 +394,7 @@ class GPTCast(L.LightningModule):
     def predict_sequence(
         self,
         seq: torch.Tensor,
+        forcing_seq: Optional[torch.Tensor] = None,
         steps: int = 1,
         window_size: Optional[int] = 16,
         padding_value: float =-1.,
@@ -348,13 +469,25 @@ class GPTCast(L.LightningModule):
         x = einops.rearrange(input_sequence, 's h w -> (s h) w')[None, None, ...]
         x = x.to(memory_format=torch.contiguous_format).float()
         c = x
-        
+
         with torch.autocast(self.device.type, enabled=True if ae_precision!=torch.float32 else False, dtype=ae_precision):
             quant_input, input_indices = self.encode_to_z(x)
             x_rec = self.decode_to_img(input_indices, quant_input.shape).squeeze()
             x_rec = x_rec.reshape(in_steps, x_rec.shape[0]//in_steps, x_rec.shape[1])
-        
-        _, c_indices = self.encode_to_c(c)
+
+        c_indices = None
+        cond_embeddings = None
+        if self.use_forcing_conditioning:
+            if forcing_seq is None:
+                raise ValueError("forcing_seq must be provided when use_forcing_conditioning=True")
+            forcing_x = forcing_seq.to(device=self.device)
+            if forcing_x.ndim != 3:
+                raise ValueError("forcing_seq must have shape (h, w, c)")
+            forcing_x = einops.rearrange(forcing_x, 'h w c -> 1 c h w').to(memory_format=torch.contiguous_format).float()
+            with torch.autocast(self.device.type, enabled=True if gpt_precision!=torch.float32 else False, dtype=gpt_precision):
+                cond_embeddings = self.encode_forcing(forcing_x)
+        else:
+            _, c_indices = self.encode_to_c(c)
         quant_shape = quant_input.shape
         indices = input_indices.reshape(quant_shape[0], in_steps, quant_shape[2] // in_steps, quant_shape[3])
         ind_b, ind_s, ind_h, ind_w = indices.shape
@@ -367,7 +500,8 @@ class GPTCast(L.LightningModule):
             with torch.autocast(self.device.type, enabled=True if gpt_precision!=torch.float32 else False, dtype=gpt_precision):
                 predicted_indices = self.predict_next_frame_indices(indices[:, -in_steps:], c_indices, window_size,
                                                                     temperature=temperature, top_k=top_k,
-                                                                    show_progress=show_token_progress,)    
+                                                                    show_progress=show_token_progress,
+                                                                    cond_embeddings=cond_embeddings,)    
             with torch.autocast(self.device.type, enabled=True if ae_precision!=torch.float32 else False, dtype=ae_precision):
                 predicted_image = self.decode_to_img(
                     predicted_indices.reshape(predicted_indices.shape[0], -1),
@@ -481,6 +615,7 @@ class GPTCast(L.LightningModule):
         *,
         steps: int = 1,
         normalized: bool = True,
+        forcing_sequence: Optional[Union[np.ndarray, np.ma.MaskedArray]] = None,
         mask: Optional[np.ndarray] = None,
         temperature: float = 1.0,
         top_k: Optional[int] = 1,
@@ -534,8 +669,16 @@ class GPTCast(L.LightningModule):
         x = torch.tensor(x, dtype=torch.float32).to(self.device)
         x = einops.rearrange(x, 's h w -> h w s')
 
+        forcing_tensor = None
+        if forcing_sequence is not None:
+            if isinstance(forcing_sequence, np.ma.MaskedArray):
+                forcing_tensor = torch.tensor(forcing_sequence.data, dtype=torch.float32).to(self.device)
+            else:
+                forcing_tensor = torch.tensor(np.asarray(forcing_sequence), dtype=torch.float32).to(self.device)
+
         result = self.predict_sequence(
             x,
+            forcing_seq=forcing_tensor,
             steps=steps,
             future=True,
             window_size=None,
@@ -565,6 +708,14 @@ class GPTCast(L.LightningModule):
             x = x.float()
         return x
 
+    def get_mask(self, batch: dict, key: str) -> Optional[torch.Tensor]:
+        if key is None or key not in batch:
+            return None
+        mask = batch[key]
+        if len(mask.shape) == 3:
+            mask = mask[:, None, ...]
+        return mask.to(memory_format=torch.contiguous_format).bool()
+
     def get_xc(self, batch: dict, N: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.get_input(self.first_stage_key, batch)
         c = self.get_input(self.cond_stage_key, batch)
@@ -572,6 +723,139 @@ class GPTCast(L.LightningModule):
             x = x[:N]
             c = c[:N]
         return x, c
+
+    def _get_physical_metric_settings(
+        self,
+    ) -> tuple[str, tuple[float, float], tuple[float, float], int, Optional[str]]:
+        datamodule = getattr(self.trainer, "datamodule", None)
+        if datamodule is None or not hasattr(datamodule, "hparams"):
+            raise RuntimeError("Physical metrics require an instantiated datamodule with hparams.")
+
+        clip_and_normalize = getattr(datamodule.hparams, "clip_and_normalize", None)
+        if clip_and_normalize is None or len(clip_and_normalize) != 4:
+            raise RuntimeError(
+                "Physical metrics require data.clip_and_normalize=(clip_min, clip_max, norm_min, norm_max)."
+            )
+
+        clip = (float(clip_and_normalize[0]), float(clip_and_normalize[1]))
+        norm = (float(clip_and_normalize[2]), float(clip_and_normalize[3]))
+        seq_len = int(getattr(datamodule.hparams, "seq_len", 1))
+        stack_seq = getattr(datamodule.hparams, "stack_seq", None)
+        image_variable_key = str(getattr(datamodule.hparams, "image_variable_key", self.first_stage_key))
+        return image_variable_key, clip, norm, seq_len, stack_seq
+
+    def _compute_teacher_forced_physical_metrics(
+        self,
+        batch: dict,
+    ) -> Optional[dict[str, torch.Tensor]]:
+        if not bool(self.hparams.log_physical_metrics):
+            return None
+
+        image_variable_key, clip, norm, seq_len, stack_seq = self._get_physical_metric_settings()
+        x, c = self.get_xc(batch)
+        batch_size = int(x.shape[0])
+
+        with torch.no_grad():
+            logits, _, z_shape = self._teacher_forced_outputs(x, c)
+            pred_indices = logits.argmax(dim=-1)
+            pred_img = self.decode_to_img(pred_indices.reshape(pred_indices.shape[0], -1), z_shape)
+
+        target_seq = self._split_stacked_sequence(x.detach(), seq_len=seq_len, stack_seq=stack_seq)
+        pred_seq = self._split_stacked_sequence(pred_img.detach(), seq_len=seq_len, stack_seq=stack_seq)
+
+        mask_seq = None
+        if "mask" in batch:
+            mask = self.get_mask(batch, "mask")
+            mask_seq = self._split_stacked_sequence(mask.float(), seq_len=seq_len, stack_seq=stack_seq).bool()
+
+        total_steps = int(target_seq.shape[1])
+        context_steps = self.hparams.physical_metric_context_steps
+        if context_steps is None or int(context_steps) < 0 or int(context_steps) >= total_steps:
+            eval_start = 0
+        else:
+            eval_start = int(context_steps)
+
+        pred_eval = pred_seq[:, eval_start:]
+        target_eval = target_seq[:, eval_start:]
+        if mask_seq is not None:
+            mask_eval = mask_seq[:, eval_start:]
+        else:
+            mask_eval = None
+
+        pred_phys = self._norm_to_phys(pred_eval, clip=clip, norm=norm)
+        target_phys = self._norm_to_phys(target_eval, clip=clip, norm=norm)
+        diff = pred_phys - target_phys
+        abs_diff = diff.abs()
+        sq_diff = diff.pow(2)
+
+        if mask_eval is not None:
+            valid = (~mask_eval).to(dtype=pred_phys.dtype)
+            reduce_dims = (0, 2, 3)
+            denom = valid.sum(dim=reduce_dims).clamp_min(1.0)
+            mae = (abs_diff * valid).sum(dim=reduce_dims) / denom
+            rmse = torch.sqrt((sq_diff * valid).sum(dim=reduce_dims) / denom)
+        else:
+            reduce_dims = (0, 2, 3)
+            mae = abs_diff.mean(dim=reduce_dims)
+            rmse = torch.sqrt(sq_diff.mean(dim=reduce_dims))
+
+        return {
+            "variable": image_variable_key,
+            "mae": mae,
+            "rmse": rmse,
+            "batch_size": torch.tensor(batch_size, device=mae.device, dtype=mae.dtype),
+        }
+
+    def _log_teacher_forced_physical_metrics(self, split: str, metrics: Optional[dict[str, torch.Tensor]]) -> None:
+        if metrics is None:
+            return
+
+        mae = metrics["mae"]
+        rmse = metrics["rmse"]
+        batch_size = int(metrics["batch_size"].item())
+
+        self.log(
+            f"{split}/tf_phys_mae_mean",
+            mae.mean(),
+            prog_bar=False,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            f"{split}/tf_phys_rmse_mean",
+            rmse.mean(),
+            prog_bar=False,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+
+        for lead_idx, (lead_mae, lead_rmse) in enumerate(zip(mae, rmse), start=1):
+            self.log(
+                f"{split}/tf_phys_mae_lead_{lead_idx:02d}",
+                lead_mae,
+                prog_bar=False,
+                logger=True,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch_size,
+            )
+            self.log(
+                f"{split}/tf_phys_rmse_lead_{lead_idx:02d}",
+                lead_rmse,
+                prog_bar=False,
+                logger=True,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch_size,
+            )
 
     def shared_step(self, batch: dict) -> torch.Tensor:
         x, c = self.get_xc(batch)
@@ -581,12 +865,51 @@ class GPTCast(L.LightningModule):
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         loss = self.shared_step(batch)
-        self.log("train/loss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        batch_size = int(batch[self.first_stage_key].shape[0])
+        self.log(
+            "train/loss",
+            loss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
         return loss
 
     def validation_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         loss = self.shared_step(batch)
-        self.log("val/loss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        batch_size = int(batch[self.first_stage_key].shape[0])
+        self.log(
+            "val/loss",
+            loss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        metrics = self._compute_teacher_forced_physical_metrics(batch)
+        self._log_teacher_forced_physical_metrics("val", metrics)
+        return loss
+
+    def test_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
+        loss = self.shared_step(batch)
+        batch_size = int(batch[self.first_stage_key].shape[0])
+        self.log(
+            "test/loss",
+            loss,
+            prog_bar=False,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        metrics = self._compute_teacher_forced_physical_metrics(batch)
+        self._log_teacher_forced_physical_metrics("test", metrics)
         return loss
 
     def configure_optimizers(self):
