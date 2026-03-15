@@ -12,6 +12,16 @@ image_variable_key: swvl1
 
 # Optional forcing variables returned as `forcing` with channels = len(vars) * seq_len.
 forcing_variable_keys: []
+guidance_variable_keys: []
+guidance_dir: null
+guidance_target_offset: null
+guidance_auto_download: false
+guidance_download_metadata_paths: []
+guidance_weekdays: [0, 3]
+guidance_min_year: 1995
+guidance_lead_days: []
+guidance_area: [42.0, 105.0, 20.0, 125.0]
+guidance_grid: "1.5/1.5"
 normalize_forcing: false
 
 # For the main image variable only. If null, the variable registry default is used.

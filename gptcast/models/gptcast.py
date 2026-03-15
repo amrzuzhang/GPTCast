@@ -860,8 +860,8 @@ class GPTCast(L.LightningModule):
     def shared_step(self, batch: dict) -> torch.Tensor:
         x, c = self.get_xc(batch)
         logits, target = self(x, c)
-        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
-        return loss
+        loss_all_tokens = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
+        return loss_all_tokens
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         loss = self.shared_step(batch)

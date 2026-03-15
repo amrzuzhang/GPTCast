@@ -56,6 +56,8 @@ What is added in this fork:
   - `gptcast/data/era5land_swvl1_datamodule.py`
   - `gptcast/data/era5land_hydro.py`
   - `gptcast/data/era5land_hydro_datamodule.py`
+  - `gptcast/data/guidance_ecmwf.py`
+  - `gptcast/data/ecmwf_s2s_download.py`
 - Hydra configs (same overall structure as the upstream experiments):
   - `configs/data/era5land_swvl1.yaml` (legacy surface-only path)
   - `configs/data/era5land_hydro.yaml` (current hydro/root-zone path)
@@ -64,6 +66,7 @@ What is added in this fork:
   - `configs/experiment/vae_mae_rzsm.yaml` / `configs/experiment/vae_phuber_rzsm.yaml`
   - `configs/experiment/gptcast_16x16_swvl1_hydro.yaml`
   - `configs/experiment/gptcast_16x16_rzsm_hydro.yaml`
+  - `configs/experiment/gptcast_16x16_rzsm_hydro_ecmwf_guided.yaml`
   - `configs/experiment/gptcast_16x16_era5land_swvl1.yaml` (legacy surface-only second stage)
 - Notebooks that **mirror the original notebook structure and plotting style**:
   - `notebooks/swvl1/example_autoencoder_reconstruction.ipynb`
@@ -100,6 +103,29 @@ for short-range hydrologic state prediction, rather than only extrapolating prec
 
 For a fuller research-motivation note, including historical context and real DOI-backed references, see
 [`RESEARCH_SIGNIFICANCE.md`](RESEARCH_SIGNIFICANCE.md).
+
+## Literature-Backed Hybrid Extension
+
+The preferred extension path for this fork is now a **hybrid forecasting setup**:
+
+- `state`: recent observed/reanalysis soil-moisture states
+- `forcing`: precipitation, evapotranspiration, runoff, temperature, radiation
+- `guidance`: external dynamic-model forecast guidance
+
+This direction is motivated by the published hybrid soil-moisture forecasting literature rather than by
+custom auxiliary losses. In this repo, the first guidance integration target is **ECMWF S2S soil-moisture guidance**.
+
+The helper entry point is:
+
+```bash
+python data/download_ecmwf_s2s_guidance.py --help
+```
+
+Important:
+
+- external research assets downloaded from third-party archives should **not** be placed inside the main repo tree
+- keep large OSF / paper-release archives in a separate directory such as `/path/to/GPTCast_external/`
+- only extract or copy the specific guidance products that are actually needed into your project data area
 
 
 ## How to run
