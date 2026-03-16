@@ -78,6 +78,34 @@ class ForcingContextEncoder(torch.nn.Module):
         return h
 
 
+class StaticContextEncoder(torch.nn.Module):
+    """Encode low-channel static fields into the same GPT prefix space as forcings."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        n_embd: int,
+        n_cond_tokens: int = 4,
+        hidden_channels: int = 64,
+    ):
+        super().__init__()
+        self.n_cond_tokens = int(n_cond_tokens)
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=2, padding=1),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=2, padding=1),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(hidden_channels, n_embd, kernel_size=1),
+            torch.nn.GELU(),
+        )
+        self.pool = torch.nn.AdaptiveAvgPool2d((self.n_cond_tokens, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.encoder(x)
+        h = self.pool(h).squeeze(-1).transpose(1, 2).contiguous()  # (B, Tcond, Cemb)
+        return h
+
+
 class GPTCast(L.LightningModule):
     default_checkpoint_path = Path(__file__).parent.parent.parent.resolve() / "models"
 
@@ -128,6 +156,8 @@ class GPTCast(L.LightningModule):
                  forcing_channels: int = 0,
                  forcing_n_cond_tokens: int = 4,
                  forcing_hidden_channels: int = 128,
+                 static_split_channels: int = 0,
+                 static_hidden_channels: int = 64,
                  pkeep: float = 1.0,
                  sos_token: int = 0,
                  base_learning_rate: float = 1e-4,
@@ -149,20 +179,38 @@ class GPTCast(L.LightningModule):
         if self.use_forcing_conditioning:
             if int(forcing_channels) < 1:
                 raise ValueError("forcing_channels must be >= 1 when use_forcing_conditioning=True")
+            self.static_split_channels = int(static_split_channels)
+            dynamic_forcing_channels = int(forcing_channels) - self.static_split_channels
+            if dynamic_forcing_channels < 1:
+                raise ValueError(
+                    "forcing_channels - static_split_channels must be >= 1 when using forcing conditioning"
+                )
             self.be_unconditional = False
             self.cond_stage_key = cond_stage_key or "forcing"
             self.cond_stage_model = None
             self.forcing_context_encoder = ForcingContextEncoder(
-                in_channels=int(forcing_channels),
+                in_channels=dynamic_forcing_channels,
                 n_embd=int(transformer.config.n_embd),
                 n_cond_tokens=int(forcing_n_cond_tokens),
                 hidden_channels=int(forcing_hidden_channels),
+            )
+            self.static_context_encoder = (
+                StaticContextEncoder(
+                    in_channels=self.static_split_channels,
+                    n_embd=int(transformer.config.n_embd),
+                    n_cond_tokens=int(forcing_n_cond_tokens),
+                    hidden_channels=int(static_hidden_channels),
+                )
+                if self.static_split_channels > 0
+                else None
             )
         else:
             # force unconditional training
             self.be_unconditional = True
             self.cond_stage_key = self.first_stage_key if cond_stage_key is None else cond_stage_key
             self.cond_stage_model = SOSProvider(self.sos_token)
+            self.static_split_channels = 0
+            self.static_context_encoder = None
 
         # self.permuter = Identity() if permuter is None else permuter
 
@@ -290,7 +338,19 @@ class GPTCast(L.LightningModule):
     def encode_forcing(self, c: torch.Tensor) -> torch.Tensor:
         if not self.use_forcing_conditioning:
             raise RuntimeError("encode_forcing called but use_forcing_conditioning=False")
-        return self.forcing_context_encoder(c)
+        if self.static_context_encoder is None or self.static_split_channels == 0:
+            return self.forcing_context_encoder(c)
+
+        if c.shape[1] <= self.static_split_channels:
+            raise ValueError(
+                f"Expected forcing tensor with more than {self.static_split_channels} channels, got {tuple(c.shape)}"
+            )
+
+        dynamic_x = c[:, :-self.static_split_channels]
+        static_x = c[:, -self.static_split_channels:]
+        dynamic_tokens = self.forcing_context_encoder(dynamic_x)
+        static_tokens = self.static_context_encoder(static_x)
+        return dynamic_tokens + static_tokens
 
     @torch.no_grad()
     def decode_to_img(self, index: torch.Tensor, zshape: torch.Size) -> torch.Tensor:

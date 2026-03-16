@@ -12,17 +12,14 @@ image_variable_key: swvl1
 
 # Optional forcing variables returned as `forcing` with channels = len(vars) * seq_len.
 forcing_variable_keys: []
-guidance_variable_keys: []
-guidance_dir: null
-guidance_target_offset: null
-guidance_auto_download: false
-guidance_download_metadata_paths: []
-guidance_weekdays: [0, 3]
-guidance_min_year: 1995
-guidance_lead_days: []
-guidance_area: [42.0, 105.0, 20.0, 125.0]
-guidance_grid: "1.5/1.5"
+static_variable_keys: []
+static_dir: null
 normalize_forcing: false
+# Examples for static_variable_keys:
+# - minimal geography: [land_mask, latitude_norm, longitude_norm]
+# - terrain-aware: [elevation_m, slope_degrees, aspect_sin, aspect_cos]
+# - soil-aware: [sand_fraction, clay_fraction, silt_fraction, porosity, field_capacity, wilting_point]
+# - deeper context: [depth_to_bedrock_m, depth_to_water_table_m, topographic_wetness_index]
 
 # For the main image variable only. If null, the variable registry default is used.
 clip_and_normalize: null

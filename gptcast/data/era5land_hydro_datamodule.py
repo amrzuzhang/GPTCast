@@ -7,9 +7,7 @@ from lightning import LightningDataModule
 from pandas import DataFrame
 from torch.utils.data import DataLoader, Dataset
 
-from gptcast.data.ecmwf_s2s_download import ensure_ecmwf_guidance
 from gptcast.data.era5land_hydro import Era5LandHydro
-from gptcast.data.guidance_ecmwf import default_guidance_root, derive_candidate_init_dates
 
 
 class Era5LandHydroDataModule(LightningDataModule):
@@ -26,16 +24,8 @@ class Era5LandHydroDataModule(LightningDataModule):
         test_metadata_path_or_df: Union[str, DataFrame],
         image_variable_key: str = "swvl1",
         forcing_variable_keys: Optional[Sequence[str]] = None,
-        guidance_variable_keys: Optional[Sequence[str]] = None,
-        guidance_dir: Optional[str] = None,
-        guidance_target_offset: Optional[int] = None,
-        guidance_auto_download: bool = False,
-        guidance_download_metadata_paths: Optional[Sequence[str]] = None,
-        guidance_weekdays: Optional[Sequence[int]] = None,
-        guidance_min_year: int = 1995,
-        guidance_lead_days: Optional[Sequence[int]] = None,
-        guidance_area: Optional[Sequence[float]] = None,
-        guidance_grid: str = "1.5/1.5",
+        static_variable_keys: Optional[Sequence[str]] = None,
+        static_dir: Optional[str] = None,
         normalize_forcing: bool = False,
         clip_and_normalize: Optional[Tuple[float, float, float, float]] = None,
         resize: Optional[Union[int, Tuple[int, int]]] = 256,
@@ -61,39 +51,7 @@ class Era5LandHydroDataModule(LightningDataModule):
         self.data_test: Optional[Dataset] = None
 
     def prepare_data(self) -> None:
-        if not self.hparams.guidance_auto_download or not self.hparams.guidance_variable_keys:
-            return
-
-        guidance_dir = (
-            default_guidance_root(self.hparams.base_dir)
-            if self.hparams.guidance_dir is None
-            else Path(self.hparams.guidance_dir)
-        )
-        metadata_sources = list(self.hparams.guidance_download_metadata_paths or [])
-        if not metadata_sources:
-            metadata_sources = [
-                self.hparams.train_metadata_path_or_df,
-                self.hparams.val_metadata_path_or_df,
-                self.hparams.test_metadata_path_or_df,
-            ]
-
-        init_dates = derive_candidate_init_dates(
-            metadata_sources,
-            weekdays=self.hparams.guidance_weekdays or (0, 3),
-            min_year=int(self.hparams.guidance_min_year),
-        )
-        if not init_dates:
-            return
-
-        ensure_ecmwf_guidance(
-            variables=self.hparams.guidance_variable_keys,
-            init_dates=init_dates,
-            out_root=guidance_dir,
-            lead_days=self.hparams.guidance_lead_days or [max(1, int(self.hparams.guidance_target_offset or self.hparams.seq_len - 1))],
-            area=self.hparams.guidance_area or (42.0, 105.0, 20.0, 125.0),
-            grid=str(self.hparams.guidance_grid),
-            overwrite=False,
-        )
+        pass
 
     def _build_dataset(self, metadata_path_or_df, *, center_crop: bool, smart_crop: bool, random_rotate90: bool):
         return Era5LandHydro(
@@ -101,9 +59,8 @@ class Era5LandHydroDataModule(LightningDataModule):
             metadata_path_or_df=metadata_path_or_df,
             image_variable_key=self.hparams.image_variable_key,
             forcing_variable_keys=self.hparams.forcing_variable_keys,
-            guidance_variable_keys=self.hparams.guidance_variable_keys,
-            guidance_dir=self.hparams.guidance_dir,
-            guidance_target_offset=self.hparams.guidance_target_offset,
+            static_variable_keys=self.hparams.static_variable_keys,
+            static_dir=self.hparams.static_dir,
             normalize_forcing=self.hparams.normalize_forcing,
             seq_len=self.hparams.seq_len,
             stack_seq=self.hparams.stack_seq,

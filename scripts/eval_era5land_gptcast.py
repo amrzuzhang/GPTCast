@@ -144,6 +144,8 @@ def build_dataset(args: argparse.Namespace) -> Era5LandHydro:
         metadata_path_or_df=str(args.metadata_path),
         image_variable_key=args.image_variable_key,
         forcing_variable_keys=args.forcing_variable_keys,
+        static_variable_keys=args.static_variable_keys,
+        static_dir=None if args.static_dir is None else str(args.static_dir),
         normalize_forcing=args.normalize_forcing,
         seq_len=args.context_steps + args.forecast_steps,
         stack_seq=None,
@@ -174,26 +176,36 @@ def maybe_prepare_forcing_context(
     example: dict,
     *,
     forcing_variable_keys: list[str],
+    static_variable_keys: list[str],
     context_steps: int,
     forecast_steps: int,
     expected_channels: Optional[int],
 ) -> Optional[np.ndarray]:
-    if "forcing" not in example or len(forcing_variable_keys) == 0:
+    if "forcing" not in example or (len(forcing_variable_keys) == 0 and len(static_variable_keys) == 0):
         return None
 
     forcing = np.asarray(example["forcing"], dtype=np.float32)
     total_steps = context_steps + forecast_steps
     n_vars = len(forcing_variable_keys)
+    n_static = len(static_variable_keys)
     h, w, channels = forcing.shape
-    expected_total_channels = n_vars * total_steps
+    expected_total_channels = n_vars * total_steps + n_static
     if channels != expected_total_channels:
         raise ValueError(
             f"Forcing tensor shape mismatch: got {channels} channels, expected "
-            f"{n_vars} variables x {total_steps} steps = {expected_total_channels}"
+            f"{n_vars} variables x {total_steps} steps + {n_static} static channels = {expected_total_channels}"
         )
 
-    forcing_4d = forcing.reshape(h, w, n_vars, total_steps)
-    forcing_context = forcing_4d[..., :context_steps].reshape(h, w, n_vars * context_steps)
+    forcing_context = None
+    if n_vars > 0:
+        dynamic = forcing[..., : n_vars * total_steps]
+        forcing_4d = dynamic.reshape(h, w, n_vars, total_steps)
+        forcing_context = forcing_4d[..., :context_steps].reshape(h, w, n_vars * context_steps)
+
+    if n_static > 0:
+        static = forcing[..., n_vars * total_steps :]
+        forcing_context = static if forcing_context is None else np.concatenate([forcing_context, static], axis=2)
+
     if expected_channels is not None and forcing_context.shape[-1] != expected_channels:
         raise ValueError(
             f"Conditioning channel mismatch: checkpoint expects {expected_channels}, "
@@ -268,6 +280,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-dir", type=Path, default=ROOT / "data/0.1/1")
     parser.add_argument("--image-variable-key", default="swvl1")
     parser.add_argument("--forcing-variable-keys", default="")
+    parser.add_argument("--static-variable-keys", default="")
+    parser.add_argument("--static-dir", type=Path, default=None)
     parser.add_argument("--normalize-forcing", type=parse_bool, default=True)
     parser.add_argument("--clip-and-normalize", default="0.0,0.8,-1.0,1.0")
     parser.add_argument("--context-steps", type=int, default=8)
@@ -290,6 +304,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
 
     args.forcing_variable_keys = parse_str_list(args.forcing_variable_keys)
+    args.static_variable_keys = parse_str_list(args.static_variable_keys)
     parsed_clip = parse_float_list(args.clip_and_normalize)
     if len(parsed_clip) != 4:
         raise ValueError("--clip-and-normalize must have 4 comma-separated floats")
@@ -354,6 +369,7 @@ def main() -> None:
         forcing_context = maybe_prepare_forcing_context(
             example,
             forcing_variable_keys=args.forcing_variable_keys,
+            static_variable_keys=args.static_variable_keys,
             context_steps=args.context_steps,
             forecast_steps=args.forecast_steps,
             expected_channels=expected_forcing_channels,
@@ -427,6 +443,8 @@ def main() -> None:
         "base_dir": str(args.base_dir),
         "image_variable_key": args.image_variable_key,
         "forcing_variable_keys": args.forcing_variable_keys,
+        "static_variable_keys": args.static_variable_keys,
+        "static_dir": None if args.static_dir is None else str(args.static_dir),
         "normalize_forcing": bool(args.normalize_forcing),
         "clip_and_normalize": list(args.clip_and_normalize),
         "context_steps": int(args.context_steps),

@@ -14,8 +14,6 @@ import torch.nn.functional as F
 import xarray as xr
 from torch.utils.data import Dataset
 
-from gptcast.data.guidance_ecmwf import ECMWF_GUIDANCE_VARIABLES, default_guidance_root
-
 
 @dataclass(frozen=True)
 class _YearCacheEntry:
@@ -35,9 +33,9 @@ class _VariableSpec:
 
 
 @dataclass(frozen=True)
-class _GuidanceSpec:
+class _StaticSpec:
     key: str
-    provider: str
+    filename: str
     var_name: str
     clip_and_normalize: Optional[Tuple[float, float, float, float]] = None
 
@@ -186,14 +184,103 @@ ERA5LAND_HYDRO_VARIABLES: dict[str, _VariableSpec] = {
 }
 
 
-ECMWF_GUIDANCE_SPECS: dict[str, _GuidanceSpec] = {
-    key: _GuidanceSpec(
-        key=spec.key,
-        provider="ecmwf",
-        var_name=spec.out_var,
-        clip_and_normalize=spec.clip_and_normalize,
-    )
-    for key, spec in ECMWF_GUIDANCE_VARIABLES.items()
+ERA5LAND_STATIC_VARIABLES: dict[str, _StaticSpec] = {
+    "land_mask": _StaticSpec(
+        key="land_mask",
+        filename="land_mask.nc",
+        var_name="land_mask",
+        clip_and_normalize=(0.0, 1.0, -1.0, 1.0),
+    ),
+    "latitude_norm": _StaticSpec(
+        key="latitude_norm",
+        filename="latitude_norm.nc",
+        var_name="latitude_norm",
+        clip_and_normalize=(-1.0, 1.0, -1.0, 1.0),
+    ),
+    "longitude_norm": _StaticSpec(
+        key="longitude_norm",
+        filename="longitude_norm.nc",
+        var_name="longitude_norm",
+        clip_and_normalize=(-1.0, 1.0, -1.0, 1.0),
+    ),
+    "elevation_m": _StaticSpec(
+        key="elevation_m",
+        filename="elevation_m.nc",
+        var_name="elevation_m",
+        clip_and_normalize=(-100.0, 6000.0, -1.0, 1.0),
+    ),
+    "slope_degrees": _StaticSpec(
+        key="slope_degrees",
+        filename="slope_degrees.nc",
+        var_name="slope_degrees",
+        clip_and_normalize=(0.0, 60.0, -1.0, 1.0),
+    ),
+    "aspect_sin": _StaticSpec(
+        key="aspect_sin",
+        filename="aspect_sin.nc",
+        var_name="aspect_sin",
+        clip_and_normalize=(-1.0, 1.0, -1.0, 1.0),
+    ),
+    "aspect_cos": _StaticSpec(
+        key="aspect_cos",
+        filename="aspect_cos.nc",
+        var_name="aspect_cos",
+        clip_and_normalize=(-1.0, 1.0, -1.0, 1.0),
+    ),
+    "topographic_wetness_index": _StaticSpec(
+        key="topographic_wetness_index",
+        filename="topographic_wetness_index.nc",
+        var_name="topographic_wetness_index",
+        clip_and_normalize=(0.0, 25.0, -1.0, 1.0),
+    ),
+    "sand_fraction": _StaticSpec(
+        key="sand_fraction",
+        filename="sand_fraction.nc",
+        var_name="sand_fraction",
+        clip_and_normalize=(0.0, 1.0, -1.0, 1.0),
+    ),
+    "clay_fraction": _StaticSpec(
+        key="clay_fraction",
+        filename="clay_fraction.nc",
+        var_name="clay_fraction",
+        clip_and_normalize=(0.0, 1.0, -1.0, 1.0),
+    ),
+    "silt_fraction": _StaticSpec(
+        key="silt_fraction",
+        filename="silt_fraction.nc",
+        var_name="silt_fraction",
+        clip_and_normalize=(0.0, 1.0, -1.0, 1.0),
+    ),
+    "porosity": _StaticSpec(
+        key="porosity",
+        filename="porosity.nc",
+        var_name="porosity",
+        clip_and_normalize=(0.0, 0.8, -1.0, 1.0),
+    ),
+    "field_capacity": _StaticSpec(
+        key="field_capacity",
+        filename="field_capacity.nc",
+        var_name="field_capacity",
+        clip_and_normalize=(0.0, 0.8, -1.0, 1.0),
+    ),
+    "wilting_point": _StaticSpec(
+        key="wilting_point",
+        filename="wilting_point.nc",
+        var_name="wilting_point",
+        clip_and_normalize=(0.0, 0.6, -1.0, 1.0),
+    ),
+    "depth_to_bedrock_m": _StaticSpec(
+        key="depth_to_bedrock_m",
+        filename="depth_to_bedrock_m.nc",
+        var_name="depth_to_bedrock_m",
+        clip_and_normalize=(0.0, 100.0, -1.0, 1.0),
+    ),
+    "depth_to_water_table_m": _StaticSpec(
+        key="depth_to_water_table_m",
+        filename="depth_to_water_table_m.nc",
+        var_name="depth_to_water_table_m",
+        clip_and_normalize=(0.0, 50.0, -1.0, 1.0),
+    ),
 }
 
 
@@ -213,9 +300,8 @@ class Era5LandHydro(Dataset):
         metadata_path_or_df: Union[str, pd.DataFrame],
         image_variable_key: str = "swvl1",
         forcing_variable_keys: Optional[Sequence[str]] = None,
-        guidance_variable_keys: Optional[Sequence[str]] = None,
-        guidance_dir: Optional[str] = None,
-        guidance_target_offset: Optional[int] = None,
+        static_variable_keys: Optional[Sequence[str]] = None,
+        static_dir: Optional[str] = None,
         normalize_forcing: bool = False,
         seq_len: int = 1,
         stack_seq: Optional[str] = None,
@@ -240,11 +326,8 @@ class Era5LandHydro(Dataset):
         self.base_dir = Path(base_dir)
         self.image_spec = self._get_spec(image_variable_key)
         self.forcing_specs = [self._get_spec(k) for k in (forcing_variable_keys or [])]
-        self.guidance_specs = [self._get_guidance_spec(k) for k in (guidance_variable_keys or [])]
-        self.guidance_dir = (
-            default_guidance_root(self.base_dir) if guidance_dir is None else Path(guidance_dir)
-        )
-        self.guidance_target_offset = guidance_target_offset
+        self.static_specs = [self._get_static_spec(k) for k in (static_variable_keys or [])]
+        self.static_dir = self.base_dir / "static" if static_dir is None else Path(static_dir)
         self.normalize_forcing = bool(normalize_forcing)
 
         if isinstance(metadata_path_or_df, str):
@@ -287,13 +370,10 @@ class Era5LandHydro(Dataset):
                     valid.append(start)
             self._start_indices = valid
 
-        if self.guidance_specs:
-            self._start_indices = [idx for idx in self._start_indices if self._has_all_guidance(idx)]
-
         self._len = len(self._start_indices)
         self._image_mask_native: Optional[np.ndarray] = None
         self._year_cache: "OrderedDict[tuple[str, int, str], _YearCacheEntry]" = OrderedDict()
-        self._guidance_cache: "OrderedDict[Path, _YearCacheEntry]" = OrderedDict()
+        self._static_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
 
     @staticmethod
     def _get_spec(key: str) -> _VariableSpec:
@@ -305,13 +385,13 @@ class Era5LandHydro(Dataset):
         return ERA5LAND_HYDRO_VARIABLES[key]
 
     @staticmethod
-    def _get_guidance_spec(key: str) -> _GuidanceSpec:
-        if key not in ECMWF_GUIDANCE_SPECS:
+    def _get_static_spec(key: str) -> _StaticSpec:
+        if key not in ERA5LAND_STATIC_VARIABLES:
             raise KeyError(
-                f"Unknown guidance variable key: {key!r}. "
-                f"Available keys: {sorted(ECMWF_GUIDANCE_SPECS)}"
+                f"Unknown static variable key: {key!r}. "
+                f"Available keys: {sorted(ERA5LAND_STATIC_VARIABLES)}"
             )
-        return ECMWF_GUIDANCE_SPECS[key]
+        return ERA5LAND_STATIC_VARIABLES[key]
 
     def __len__(self) -> int:
         return self._len
@@ -346,54 +426,30 @@ class Era5LandHydro(Dataset):
         self._year_cache[cache_key] = entry
         return entry
 
-    def _guidance_file_path(self, spec: _GuidanceSpec, dt: datetime) -> Path:
-        return self.guidance_dir / spec.key / f"{dt.year:04d}" / f"{dt:%Y%m%d}.nc"
+    def _static_file_path(self, spec: _StaticSpec) -> Path:
+        return self.static_dir / spec.filename
 
-    def _get_guidance_entry(self, spec: _GuidanceSpec, dt: datetime) -> _YearCacheEntry:
-        file_path = self._guidance_file_path(spec, dt)
-        if file_path in self._guidance_cache:
-            entry = self._guidance_cache.pop(file_path)
-            self._guidance_cache[file_path] = entry
-            return entry
+    def _read_static_native(self, spec: _StaticSpec) -> np.ndarray:
+        cache_key = spec.key
+        if cache_key in self._static_cache:
+            return self._static_cache[cache_key]
 
-        while len(self._guidance_cache) >= self.max_open_years:
-            _, old = self._guidance_cache.popitem(last=False)
+        path = self._static_file_path(spec)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Missing static feature file for {spec.key!r}: {path}\n"
+                "Generate the static files first (see build_era5land_static_features.py)."
+            )
+        ds = xr.open_dataset(path)
+        try:
+            arr = ds[spec.var_name].values.astype(np.float32, copy=False)
+        finally:
             try:
-                old.ds.close()
+                ds.close()
             except Exception:
                 pass
-
-        if not file_path.exists():
-            raise FileNotFoundError(
-                f"Missing guidance file for variable {spec.key!r}: {file_path}\n"
-                "Download the requested ECMWF guidance files first, or enable guidance auto-download."
-            )
-
-        ds = xr.open_dataset(file_path)
-        if "lead_day" in ds.coords:
-            time_index = pd.Index(ds["lead_day"].values)
-        elif "lead_day" in ds.dims:
-            time_index = pd.Index(ds["lead_day"].values)
-        else:
-            raise RuntimeError(f"Guidance file does not contain lead_day coordinate: {file_path}")
-
-        entry = _YearCacheEntry(ds=ds, time_index=time_index)
-        self._guidance_cache[file_path] = entry
-        return entry
-
-    def _get_guidance_target_offset(self) -> int:
-        if self.guidance_target_offset is None:
-            return max(0, int(self.seq_len) - 1)
-        offset = int(self.guidance_target_offset)
-        if offset < 0 or offset >= int(self.seq_len):
-            raise ValueError(
-                f"guidance_target_offset must be in [0, seq_len-1], got {offset} for seq_len={self.seq_len}"
-            )
-        return offset
-
-    def _has_all_guidance(self, start_idx: int) -> bool:
-        init_dt = self._timestamps[start_idx]
-        return all(self._guidance_file_path(spec, init_dt).exists() for spec in self.guidance_specs)
+        self._static_cache[cache_key] = arr
+        return arr
 
     def _read_frame_native(self, spec: _VariableSpec, dt: datetime) -> np.ndarray:
         if spec.derived:
@@ -405,19 +461,6 @@ class Era5LandHydro(Dataset):
         except KeyError:
             tidx = int(entry.time_index.get_indexer([pd.Timestamp(dt)], method="nearest")[0])
         arr = entry.ds[spec.var_name].isel(time=tidx).values
-        return arr.astype(np.float32, copy=False)
-
-    def _read_guidance_frame_native(self, spec: _GuidanceSpec, init_dt: datetime, lead_day: int) -> np.ndarray:
-        entry = self._get_guidance_entry(spec, init_dt)
-        try:
-            lead_idx = int(entry.time_index.get_loc(int(lead_day)))
-        except KeyError:
-            lead_idx = int(entry.time_index.get_indexer([int(lead_day)])[0])
-            if lead_idx < 0:
-                raise KeyError(
-                    f"Lead day {lead_day} not found in guidance file for {spec.key!r} at init {init_dt:%Y-%m-%d}"
-                )
-        arr = entry.ds[spec.var_name].isel(lead_day=lead_idx).values
         return arr.astype(np.float32, copy=False)
 
     def _read_derived_frame_native(self, spec: _VariableSpec, dt: datetime) -> np.ndarray:
@@ -444,6 +487,17 @@ class Era5LandHydro(Dataset):
 
     @staticmethod
     def _normalize(arr: np.ndarray, spec: _VariableSpec, normalize: bool) -> np.ndarray:
+        if not normalize or spec.clip_and_normalize is None:
+            return np.nan_to_num(arr, nan=0.0).astype(np.float32, copy=False)
+        cmin, cmax, nmin, nmax = spec.clip_and_normalize
+        out = np.nan_to_num(arr, nan=float(cmin))
+        out = np.clip(out, float(cmin), float(cmax))
+        out = (out - float(cmin)) / (float(cmax) - float(cmin) + 1e-12)
+        out = out * (float(nmax) - float(nmin)) + float(nmin)
+        return out.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _normalize_static(arr: np.ndarray, spec: _StaticSpec, normalize: bool) -> np.ndarray:
         if not normalize or spec.clip_and_normalize is None:
             return np.nan_to_num(arr, nan=0.0).astype(np.float32, copy=False)
         cmin, cmax, nmin, nmax = spec.clip_and_normalize
@@ -545,15 +599,14 @@ class Era5LandHydro(Dataset):
                 forcing_groups.append(samples)
             forcing = np.stack(forcing_groups, axis=0)  # (V, S, H, W)
 
-        guidance = None
-        if self.guidance_specs:
-            lead_day = self._get_guidance_target_offset()
-            guidance_groups = []
-            for spec in self.guidance_specs:
-                arr = self._read_guidance_frame_native(spec, t0, lead_day=lead_day)
-                arr = self._normalize(arr[None, ...], spec, normalize=self.normalize_forcing)[0]
-                guidance_groups.append(arr)
-            guidance = np.stack(guidance_groups, axis=0)  # (V, H, W)
+        static = None
+        if self.static_specs:
+            static_groups = []
+            for spec in self.static_specs:
+                arr = self._read_static_native(spec)
+                arr = self._normalize_static(arr, spec, normalize=self.normalize_forcing)
+                static_groups.append(arr)
+            static = np.stack(static_groups, axis=0)  # (V, H, W)
 
         if self.resize is not None:
             size_hw = (int(self.resize), int(self.resize)) if isinstance(self.resize, int) else (int(self.resize[0]), int(self.resize[1]))
@@ -563,8 +616,8 @@ class Era5LandHydro(Dataset):
                 v, s, _, _ = forcing.shape
                 forcing = forcing.reshape(v * s, forcing.shape[-2], forcing.shape[-1])
                 forcing = self._resize_sequence(forcing, size_hw).reshape(v, s, size_hw[0], size_hw[1])
-            if guidance is not None:
-                guidance = self._resize_sequence(guidance, size_hw)
+            if static is not None:
+                static = self._resize_sequence(static, size_hw)
 
         y0, x0 = self._pick_crop(
             mask=mask,
@@ -579,16 +632,16 @@ class Era5LandHydro(Dataset):
         mask = self._crop(mask[None, ...], y0, x0, self.crop)[0]
         if forcing is not None:
             forcing = self._crop(forcing, y0, x0, self.crop)
-        if guidance is not None:
-            guidance = self._crop(guidance, y0, x0, self.crop)
+        if static is not None:
+            static = self._crop(static, y0, x0, self.crop)
 
         rot_k = np.random.randint(0, 4) if self.random_rotate90 else 0
         image_samples = self._rotate_hw(image_samples, rot_k)
         mask = self._rotate_hw(mask[None, ...], rot_k)[0].astype(bool)
         if forcing is not None:
             forcing = self._rotate_hw(forcing, rot_k)
-        if guidance is not None:
-            guidance = self._rotate_hw(guidance, rot_k)
+        if static is not None:
+            static = self._rotate_hw(static, rot_k)
 
         image = np.transpose(image_samples, (1, 2, 0))
         if self.stack is not None:
@@ -605,17 +658,16 @@ class Era5LandHydro(Dataset):
             "file_path_": t0.strftime(self.date_fmt),
         }
 
+        forcing_hwc = None
         if forcing is not None:
             forcing_hwc = np.transpose(forcing, (2, 3, 0, 1)).reshape(forcing.shape[-2], forcing.shape[-1], -1)
-        else:
-            forcing_hwc = None
-        if guidance is not None:
-            guidance_hwc = np.transpose(guidance, (1, 2, 0))
-            example["guidance"] = guidance_hwc.astype(np.float32, copy=False)
+        if static is not None:
+            static_hwc = np.transpose(static, (1, 2, 0))
+            example["static"] = static_hwc.astype(np.float32, copy=False)
             if forcing_hwc is None:
-                forcing_hwc = guidance_hwc
+                forcing_hwc = static_hwc
             else:
-                forcing_hwc = np.concatenate([forcing_hwc, guidance_hwc], axis=2)
+                forcing_hwc = np.concatenate([forcing_hwc, static_hwc], axis=2)
         if forcing_hwc is not None:
             example["forcing"] = forcing_hwc.astype(np.float32, copy=False)
 

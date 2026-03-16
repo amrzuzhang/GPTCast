@@ -56,8 +56,6 @@ What is added in this fork:
   - `gptcast/data/era5land_swvl1_datamodule.py`
   - `gptcast/data/era5land_hydro.py`
   - `gptcast/data/era5land_hydro_datamodule.py`
-  - `gptcast/data/guidance_ecmwf.py`
-  - `gptcast/data/ecmwf_s2s_download.py`
 - Hydra configs (same overall structure as the upstream experiments):
   - `configs/data/era5land_swvl1.yaml` (legacy surface-only path)
   - `configs/data/era5land_hydro.yaml` (current hydro/root-zone path)
@@ -66,7 +64,6 @@ What is added in this fork:
   - `configs/experiment/vae_mae_rzsm.yaml` / `configs/experiment/vae_phuber_rzsm.yaml`
   - `configs/experiment/gptcast_16x16_swvl1_hydro.yaml`
   - `configs/experiment/gptcast_16x16_rzsm_hydro.yaml`
-  - `configs/experiment/gptcast_16x16_rzsm_hydro_ecmwf_guided.yaml`
   - `configs/experiment/gptcast_16x16_era5land_swvl1.yaml` (legacy surface-only second stage)
 - Notebooks that **mirror the original notebook structure and plotting style**:
   - `notebooks/swvl1/example_autoencoder_reconstruction.ipynb`
@@ -103,29 +100,6 @@ for short-range hydrologic state prediction, rather than only extrapolating prec
 
 For a fuller research-motivation note, including historical context and real DOI-backed references, see
 [`RESEARCH_SIGNIFICANCE.md`](RESEARCH_SIGNIFICANCE.md).
-
-## Literature-Backed Hybrid Extension
-
-The preferred extension path for this fork is now a **hybrid forecasting setup**:
-
-- `state`: recent observed/reanalysis soil-moisture states
-- `forcing`: precipitation, evapotranspiration, runoff, temperature, radiation
-- `guidance`: external dynamic-model forecast guidance
-
-This direction is motivated by the published hybrid soil-moisture forecasting literature rather than by
-custom auxiliary losses. In this repo, the first guidance integration target is **ECMWF S2S soil-moisture guidance**.
-
-The helper entry point is:
-
-```bash
-python data/download_ecmwf_s2s_guidance.py --help
-```
-
-Important:
-
-- external research assets downloaded from third-party archives should **not** be placed inside the main repo tree
-- keep large OSF / paper-release archives in a separate directory such as `/path/to/GPTCast_external/`
-- only extract or copy the specific guidance products that are actually needed into your project data area
 
 
 ## How to run
@@ -321,6 +295,103 @@ The `swvl1_hydro` config is useful for validating the conditional pipeline with
 your current files. The `rzsm_hydro` config is the preferred hydrologic path
 once the root-zone variables are fully downloaded.
 
+The current route-A enhancement is:
+
+- `configs/experiment/gptcast_16x16_rzsm_hydro.yaml`
+  - clean baseline (`state + forcing`, no static terrain/soil context)
+- `configs/experiment/gptcast_16x16_rzsm_hydro_static.yaml`
+  - physical-context-aware enhancement
+  - uses a separate static encoder branch for terrain/soil background fields
+  - currently expects 7 static channels:
+    `land_mask`, `latitude_norm`, `longitude_norm`, `sand_fraction`,
+    `clay_fraction`, `silt_fraction`, `porosity`
+
+Important wording:
+- this static-aware route is a **physical-context-aware enhancement**
+- it is **not** a hard physics-loss / hard conservation method
+- `tf_phys_*` metrics remain **physical monitoring**, not physical constraints
+
+### Static Terrain / Soil Context
+
+The current static-feature builder supports two modes:
+
+1. minimal geography only:
+   - `land_mask`
+   - `latitude_norm`
+   - `longitude_norm`
+2. enhanced terrain / soil context when ancillary NetCDFs are available
+
+To build the minimal static features:
+
+```bash
+python data/build_era5land_static_features.py \
+  --base-dir data/0.1/1 \
+  --year 1979
+```
+
+If you have external ancillary rasters already converted to NetCDF files on disk,
+place them in a directory such as:
+
+```text
+data/0.1/1/static_raw/
+  elevation_m.nc
+  sand_fraction.nc
+  clay_fraction.nc
+  silt_fraction.nc
+  porosity.nc
+  field_capacity.nc
+  wilting_point.nc
+  depth_to_bedrock_m.nc
+  depth_to_water_table_m.nc
+  topographic_wetness_index.nc
+```
+
+Then run:
+
+```bash
+python data/build_era5land_static_features.py \
+  --base-dir data/0.1/1 \
+  --year 1979 \
+  --ancillary-dir data/0.1/1/static_raw
+```
+
+Notes:
+- `elevation_m.nc` is special: if present, the script also derives
+  `slope_degrees`, `aspect_sin`, and `aspect_cos` automatically.
+- Each ancillary file should contain either a variable with the same name as the
+  filename stem, or a single 2D data variable that can be inferred automatically.
+- The hydro datamodule now recognizes terrain/soil static keys such as
+  `elevation_m`, `slope_degrees`, `aspect_sin`, `aspect_cos`, `sand_fraction`,
+  `clay_fraction`, `silt_fraction`, `porosity`, `field_capacity`,
+  `wilting_point`, `depth_to_bedrock_m`, `depth_to_water_table_m`, and
+  `topographic_wetness_index`.
+
+If you want to automatically download a subset of soil static properties aligned to
+the ERA5-Land grid, use the SoilGrids helper:
+
+```bash
+python data/download_soilgrids_static.py \
+  --base-dir data/0.1/1 \
+  --year 1979
+```
+
+This downloads/derives:
+- `sand_fraction`
+- `clay_fraction`
+- `silt_fraction`
+- `porosity` (derived from SoilGrids bulk density)
+
+By default it also regenerates the minimal static files into `data/0.1/1/static/`.
+
+Important:
+- This is **not** part of the CDS ERA5-Land product, so the original CDS downloader
+  cannot fetch these fields.
+- The current `soilgrids` Python wrapper/service map does **not** expose
+  `wv003` / `wv1500` as service ids, so `field_capacity` / `wilting_point`
+  are not downloaded automatically by this helper.
+- DEM / topographic wetness / bedrock / water-table depth still need their own
+  sources. The static builder can already ingest those once you provide NetCDFs.
+
 For the hydro GPT configs, the transformer budget is expanded to
 `block_size=2304`, allowing a small multi-token forcing prefix while keeping
 the original 16x16 spatial tokenization.
@@ -390,6 +461,51 @@ python gptcast/train.py \
   data.center_crop_val=true \
   model.base_learning_rate=2.8125e-6
 ```
+
+Recommended two-GPU run (baseline vs physical-context-aware static enhancement):
+
+```bash
+cd /path/to/GPTCast
+export PROJECT_ROOT="$PWD"
+
+FIRST_STAGE_CKPT=/path/to/phuber_rzsm_best.ckpt
+```
+
+```bash
+# GPU 0: clean baseline
+CUDA_VISIBLE_DEVICES=0 python gptcast/train.py \
+  experiment=gptcast_16x16_rzsm_hydro \
+  model.first_stage.ckpt_path="$FIRST_STAGE_CKPT" \
+  test=False \
+  data.batch_size=8 \
+  data.num_workers=8 \
+  data.pin_memory=true \
+  data.center_crop_val=true \
+  model.base_learning_rate=2.8125e-6
+```
+
+```bash
+# GPU 1: physical-context-aware static enhancement
+CUDA_VISIBLE_DEVICES=1 python gptcast/train.py \
+  experiment=gptcast_16x16_rzsm_hydro_static \
+  model.first_stage.ckpt_path="$FIRST_STAGE_CKPT" \
+  test=False \
+  data.batch_size=8 \
+  data.num_workers=8 \
+  data.pin_memory=true \
+  data.center_crop_val=true \
+  model.base_learning_rate=2.8125e-6
+```
+
+Compared with the clean baseline, the current static-aware configuration adds:
+- 7 static terrain/soil channels on top of the 40 dynamic forcing channels
+- a separate static encoder branch that is fused with the dynamic forcing encoder
+
+So the conditioning changes from:
+- baseline: `40 = 5 forcing vars x 8 context steps`
+
+to:
+- physical-context-aware: `47 = 40 dynamic forcing + 7 static terrain/soil channels`
 
 If you prefer a larger batch on the same GPU:
 
