@@ -4,6 +4,10 @@
 
 _Fork of GPTCast (Franch et al., GMD 2025), adapted to ERA5-Land `swvl1` (volumetric soil water, layer 1)._
 
+[![简体中文](https://img.shields.io/badge/简体中文-README.zh--CN.md-0A7E8C?style=for-the-badge)](README.zh-CN.md)
+[![繁體中文](https://img.shields.io/badge/繁體中文-README.zh--TW.md-0A7E8C?style=for-the-badge)](README.zh-TW.md)
+[![日本語](https://img.shields.io/badge/日本語-README.ja.md-0A7E8C?style=for-the-badge)](README.ja.md)
+
 <a href="https://pytorch.org/get-started/locally/"><img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-ee4c2c?logo=pytorch&logoColor=white"></a>
 <a href="https://pytorchlightning.ai/"><img alt="Lightning" src="https://img.shields.io/badge/-Lightning-792ee5?logo=pytorchlightning&logoColor=white"></a>
 <a href="https://hydra.cc/"><img alt="Config: Hydra" src="https://img.shields.io/badge/Config-Hydra-89b8cd"></a>
@@ -13,6 +17,40 @@ _Fork of GPTCast (Franch et al., GMD 2025), adapted to ERA5-Land `swvl1` (volume
 </div>
 
 <br>
+
+## This Work
+
+This fork is not a generic dataset swap. It repurposes GPTCast from precipitation/radar nowcasting to
+**daily short-range soil moisture forecasting over East China**, with emphasis on **hydrologically meaningful
+state prediction** instead of image extrapolation.
+
+Current mainline:
+
+- **Stage 1**: train a root-zone tokenizer on `rzsm_0_100cm`
+- **Stage 2 baseline**: train a `state + forcing` daily GPT forecaster
+- **Stage 2 enhancement**: add **physical-context-aware static information** (terrain / soil background) through a
+  dedicated static encoder branch
+
+Scientific target:
+
+- predict `D+1 ... D+7` soil water states from recent soil moisture history
+- focus on `swvl1`, `rzsm_0_100cm`, and `soil_water_storage_0_100cm_mm`
+- improve physical realism with **forcing design + static context**, not with ad hoc homemade physics losses
+
+Method summary:
+
+- **State sequence**: recent soil moisture states tokenized by a first-stage VAE/VQ tokenizer
+- **Dynamic forcing**: precipitation, evapotranspiration, runoff, temperature, and radiation
+- **Static physical context**: land mask, geography, and now terrain/soil properties such as
+  `sand_fraction`, `clay_fraction`, `silt_fraction`, and `porosity`
+- **Second-stage model**: GPT-style autoregressive token forecasting with separate dynamic/static conditioning paths
+- **Physical evaluation**: teacher-forced `tf_phys_*` monitoring during validation plus rollout-based downstream evaluation
+
+Repository intent:
+
+- keep the upstream GPTCast code structure where possible
+- add hydro-specific data modules, configs, and notebooks
+- make the project publishable as a soil-moisture forecasting paper rather than a precipitation-nowcasting fork
 
 ## Description
 
