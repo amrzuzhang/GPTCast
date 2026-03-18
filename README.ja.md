@@ -33,8 +33,8 @@
 
 第二段階では単純な画像外挿ではなく、**state + forcing** による token 生成予測を行います。
 
-- baseline: `gptcast_16x16_rzsm_hydro`
-- 強化版: `gptcast_16x16_rzsm_hydro_static`
+- baseline: `soilcast_16x16_rzsm_hydro`
+- 強化版: `soilcast_16x16_rzsm_hydro_static`
 
 強化版では、ad hoc な physics loss を追加するのではなく、
 **物理的に意味のある静的背景情報**を導入します。
@@ -68,8 +68,8 @@
   - `configs/data/era5land_hydro.yaml`
   - `configs/experiment/vae_mae_rzsm.yaml`
   - `configs/experiment/vae_phuber_rzsm.yaml`
-  - `configs/experiment/gptcast_16x16_rzsm_hydro.yaml`
-  - `configs/experiment/gptcast_16x16_rzsm_hydro_static.yaml`
+  - `configs/experiment/soilcast_16x16_rzsm_hydro.yaml`
+  - `configs/experiment/soilcast_16x16_rzsm_hydro_static.yaml`
 - 静的特徴:
   - `data/build_era5land_static_features.py`
   - `data/download_soilgrids_static.py`

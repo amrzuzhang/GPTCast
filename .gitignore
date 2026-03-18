@@ -158,6 +158,7 @@ configs/local/default.yaml
 /data/*.tar
 /data/*/
 /logs/
+/outputs/
 /models/*.ckpt
 /models/*/
 .env

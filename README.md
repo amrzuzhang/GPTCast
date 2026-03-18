@@ -1,8 +1,8 @@
 <div align="center">
 
-# GPTCast-SWVL1: a weather language model for soil moisture forecasting (ERA5-Land)
+# SoilCast: a generative framework for soil moisture forecasting (ERA5-Land)
 
-_Fork of GPTCast (Franch et al., GMD 2025), adapted to ERA5-Land `swvl1` (volumetric soil water, layer 1)._
+_A GPTCast-derived framework adapted to ERA5-Land soil moisture forecasting._
 
 [![简体中文](https://img.shields.io/badge/简体中文-README.zh--CN.md-0A7E8C?style=for-the-badge)](README.zh-CN.md)
 [![繁體中文](https://img.shields.io/badge/繁體中文-README.zh--TW.md-0A7E8C?style=for-the-badge)](README.zh-TW.md)
@@ -20,14 +20,14 @@ _Fork of GPTCast (Franch et al., GMD 2025), adapted to ERA5-Land `swvl1` (volume
 
 ## This Work
 
-This fork is not a generic dataset swap. It repurposes GPTCast from precipitation/radar nowcasting to
+SoilCast is not a generic dataset swap. It repurposes GPTCast from precipitation/radar nowcasting to
 **daily short-range soil moisture forecasting over East China**, with emphasis on **hydrologically meaningful
 state prediction** instead of image extrapolation.
 
 Current mainline:
 
 - **Stage 1**: train a root-zone tokenizer on `rzsm_0_100cm`
-- **Stage 2 baseline**: train a `state + forcing` daily GPT forecaster
+- **Stage 2 baseline**: train a `state + forcing` daily SoilCast forecaster
 - **Stage 2 enhancement**: add **physical-context-aware static information** (terrain / soil background) through a
   dedicated static encoder branch
 
@@ -39,16 +39,25 @@ Scientific target:
 
 Method summary:
 
-- **State sequence**: recent soil moisture states tokenized by a first-stage VAE/VQ tokenizer
+- **Stage-1 representation learning**: recent soil-moisture states are compressed into tokens by a first-stage VAE/VQ tokenizer
 - **Dynamic forcing**: precipitation, evapotranspiration, runoff, temperature, and radiation
 - **Static physical context**: land mask, geography, and now terrain/soil properties such as
   `sand_fraction`, `clay_fraction`, `silt_fraction`, and `porosity`
-- **Second-stage model**: GPT-style autoregressive token forecasting with separate dynamic/static conditioning paths
+- **Second-stage model**: autoregressive token forecasting with separate dynamic/static conditioning paths
 - **Physical evaluation**: teacher-forced `tf_phys_*` monitoring during validation plus rollout-based downstream evaluation
+
+Important interpretation:
+
+- The **first stage is not a full hydrological model**.
+- It is better described as **hydrologically meaningful state representation learning** for variables such as
+  `swvl1` and `rzsm_0_100cm`.
+- The first stage learns how to compress and reconstruct soil-moisture state fields.
+- The part that is closer to hydrological modeling is the **second stage**, where `state + forcing (+ static context)`
+  are used to predict future soil-water states.
 
 Repository intent:
 
-- keep the upstream GPTCast code structure where possible
+- keep the upstream GPTCast code structure where possible while exposing a distinct SoilCast research identity
 - add hydro-specific data modules, configs, and notebooks
 - make the project publishable as a soil-moisture forecasting paper rather than a precipitation-nowcasting fork
 
@@ -86,7 +95,7 @@ In addition to the upstream precipitation/radar nowcasting workflow, this fork a
 **ERA5-Land soil moisture forecasting**, with the current mainline centered on:
 - surface soil moisture (`swvl1`)
 - root-zone moisture / storage (`rzsm_0_100cm`, `soil_water_storage_0_100cm_mm`)
-- hydro-aware second-stage GPT experiments with explicit forcing inputs
+- hydro-aware second-stage SoilCast experiments with explicit forcing inputs
 
 What is added in this fork:
 - Dataset + LightningDataModule:
@@ -100,9 +109,9 @@ What is added in this fork:
   - `configs/experiment/vae_mae_swvl1.yaml` (baseline first stage)
   - `configs/experiment/vae_phuber_swvl1.yaml` (main first stage)
   - `configs/experiment/vae_mae_rzsm.yaml` / `configs/experiment/vae_phuber_rzsm.yaml`
-  - `configs/experiment/gptcast_16x16_swvl1_hydro.yaml`
-  - `configs/experiment/gptcast_16x16_rzsm_hydro.yaml`
-  - `configs/experiment/gptcast_16x16_era5land_swvl1.yaml` (legacy surface-only second stage)
+  - `configs/experiment/soilcast_16x16_swvl1_hydro.yaml`
+  - `configs/experiment/soilcast_16x16_rzsm_hydro.yaml`
+  - `configs/experiment/soilcast_16x16_era5land_swvl1.yaml` (legacy surface-only second stage)
 - Notebooks that **mirror the original notebook structure and plotting style**:
   - `notebooks/swvl1/example_autoencoder_reconstruction.ipynb`
   - `notebooks/swvl1/example_gptcast_forecast.ipynb`
@@ -159,9 +168,20 @@ Example Conda setup:
 conda create -n gptcast python=3.12 -y
 conda activate gptcast
 
-# Install package + dependencies
+# Install the reproducible core dependency set first
+pip install -r requirements.txt
+
+# Then install the local package in editable mode
 pip install -e .
 ```
+
+Optional note:
+
+- `requirements.txt` is the recommended reproducible core environment for
+  SoilCast training, evaluation, notebooks, and paper figures.
+- The optional SoilGrids downloader is best installed in a **separate**
+  environment because it may otherwise upgrade `numpy` / `xarray` and
+  destabilize the main training environment.
 
 ### ERA5-Land SWVL1 (Soil Moisture) Notebooks (This Fork)
 
@@ -321,13 +341,13 @@ python gptcast/train.py trainer=gpu experiment=vae_phuber_rzsm test=False
 These experiments use the generic hydro datamodule and are the recommended path
 for moving from surface-state prediction toward more hydrologically meaningful storage prediction.
 
-### Hydro GPT: State + Forcing
+### Hydro SoilCast: State + Forcing
 
 The next step is to train the second stage with the generic hydro datamodule and
 explicit forcing inputs. Two configs are provided:
 
-- `configs/experiment/gptcast_16x16_swvl1_hydro.yaml`
-- `configs/experiment/gptcast_16x16_rzsm_hydro.yaml`
+- `configs/experiment/soilcast_16x16_swvl1_hydro.yaml`
+- `configs/experiment/soilcast_16x16_rzsm_hydro.yaml`
 
 The `swvl1_hydro` config is useful for validating the conditional pipeline with
 your current files. The `rzsm_hydro` config is the preferred hydrologic path
@@ -335,9 +355,9 @@ once the root-zone variables are fully downloaded.
 
 The current route-A enhancement is:
 
-- `configs/experiment/gptcast_16x16_rzsm_hydro.yaml`
+- `configs/experiment/soilcast_16x16_rzsm_hydro.yaml`
   - clean baseline (`state + forcing`, no static terrain/soil context)
-- `configs/experiment/gptcast_16x16_rzsm_hydro_static.yaml`
+- `configs/experiment/soilcast_16x16_rzsm_hydro_static.yaml`
   - physical-context-aware enhancement
   - uses a separate static encoder branch for terrain/soil background fields
   - currently expects 7 static channels:
@@ -430,31 +450,31 @@ Important:
 - DEM / topographic wetness / bedrock / water-table depth still need their own
   sources. The static builder can already ingest those once you provide NetCDFs.
 
-For the hydro GPT configs, the transformer budget is expanded to
+For the hydro SoilCast configs, the transformer budget is expanded to
 `block_size=2304`, allowing a small multi-token forcing prefix while keeping
 the original 16x16 spatial tokenization.
 
 Example:
 
 ```bash
-python gptcast/train.py trainer=gpu experiment=gptcast_16x16_swvl1_hydro \
+python gptcast/train.py trainer=gpu experiment=soilcast_16x16_swvl1_hydro \
   model.first_stage.ckpt_path=<path_to_swvl1_tokenizer_checkpoint> \
   test=False
 ```
 
 ```bash
-python gptcast/train.py trainer=gpu experiment=gptcast_16x16_rzsm_hydro \
+python gptcast/train.py trainer=gpu experiment=soilcast_16x16_rzsm_hydro \
   model.first_stage.ckpt_path=<path_to_rzsm_tokenizer_checkpoint> \
   test=False
 ```
 
-### Train GPTCast
-After training the VAE, train the GPTCast model with one of the following configurations contained in the folder [configs/experiment/](configs/experiment/):
+### Train SoilCast
+After training the VAE, train the SoilCast second-stage model with one of the following configurations contained in the folder [configs/experiment/](configs/experiment/):
 - [gptcast_8x8](configs/experiment/gptcast_8x8.yaml) - 8x8 token spatial context (128x128 pixels)
 - [gptcast_16x16](configs/experiment/gptcast_16x16.yaml) - 16x16 token spatial context (256x256 pixels)
 
 ```bash
-# train GPTCast with a 16x16 token spatial context on GPU
+# train the upstream GPT-derived forecaster with a 16x16 token spatial context on GPU
 # the result (including model checkpoints) will be saved in the folder `logs/train/`
 # the VAE checkpoint path should be provided
 python gptcast/train.py trainer=gpu experiment=gptcast_16x16 model.first_stage.ckpt_path=<path_to_vae_checkpoint>
@@ -463,11 +483,11 @@ python gptcast/train.py trainer=gpu experiment=gptcast_16x16 model.first_stage.c
 Preferred second-stage path in this fork:
 
 ```bash
-python gptcast/train.py trainer=gpu experiment=gptcast_16x16_swvl1_hydro \
+python gptcast/train.py trainer=gpu experiment=soilcast_16x16_swvl1_hydro \
   model.first_stage.ckpt_path=<path_to_swvl1_vae_checkpoint> \
   test=False
 
-python gptcast/train.py trainer=gpu experiment=gptcast_16x16_rzsm_hydro \
+python gptcast/train.py trainer=gpu experiment=soilcast_16x16_rzsm_hydro \
   model.first_stage.ckpt_path=<path_to_rzsm_vae_checkpoint> \
   test=False
 ```
@@ -475,7 +495,7 @@ python gptcast/train.py trainer=gpu experiment=gptcast_16x16_rzsm_hydro \
 Legacy surface-only GPT baseline (kept for comparison only):
 
 ```bash
-python gptcast/train.py trainer=gpu experiment=gptcast_16x16_era5land_swvl1 \
+python gptcast/train.py trainer=gpu experiment=soilcast_16x16_era5land_swvl1 \
   model.first_stage.ckpt_path=<path_to_swvl1_vae_checkpoint>
 ```
 
@@ -488,9 +508,9 @@ echo "$FIRST_STAGE_CKPT"
 ```
 
 ```bash
-# Stage 2: hydro GPT forecaster
+# Stage 2: hydro SoilCast forecaster
 python gptcast/train.py \
-  experiment=gptcast_16x16_rzsm_hydro \
+  experiment=soilcast_16x16_rzsm_hydro \
   model.first_stage.ckpt_path="$FIRST_STAGE_CKPT" \
   test=False \
   data.batch_size=8 \
@@ -512,7 +532,7 @@ FIRST_STAGE_CKPT=/path/to/phuber_rzsm_best.ckpt
 ```bash
 # GPU 0: clean baseline
 CUDA_VISIBLE_DEVICES=0 python gptcast/train.py \
-  experiment=gptcast_16x16_rzsm_hydro \
+  experiment=soilcast_16x16_rzsm_hydro \
   model.first_stage.ckpt_path="$FIRST_STAGE_CKPT" \
   test=False \
   data.batch_size=8 \
@@ -525,7 +545,7 @@ CUDA_VISIBLE_DEVICES=0 python gptcast/train.py \
 ```bash
 # GPU 1: physical-context-aware static enhancement
 CUDA_VISIBLE_DEVICES=1 python gptcast/train.py \
-  experiment=gptcast_16x16_rzsm_hydro_static \
+  experiment=soilcast_16x16_rzsm_hydro_static \
   model.first_stage.ckpt_path="$FIRST_STAGE_CKPT" \
   test=False \
   data.batch_size=8 \
@@ -553,7 +573,7 @@ data.batch_size=10 model.base_learning_rate=2.25e-6
 ```
 
 Practical note: the legacy surface-only inference path is still designed around a maximum context length of
-**7 steps** with `block_size=2048`. The hydro GPT configs increase the transformer budget to
+**7 steps** with `block_size=2048`. The hydro SoilCast configs increase the transformer budget to
 `block_size=2304` to accommodate a small forcing prefix while keeping the notebook defaults at 7 forecast/eval steps.
 
 ## TensorBoard

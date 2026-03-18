@@ -32,8 +32,8 @@
 
 第二階段不是直接做影像外推，而是做 **state + forcing** 的 token 生成預報：
 
-- baseline：`gptcast_16x16_rzsm_hydro`
-- 增強版：`gptcast_16x16_rzsm_hydro_static`
+- baseline：`soilcast_16x16_rzsm_hydro`
+- 增強版：`soilcast_16x16_rzsm_hydro_static`
 
 增強版不是硬塞自製 physics loss，而是加入**更有物理意義的靜態背景資訊**：
 
@@ -66,8 +66,8 @@
   - `configs/data/era5land_hydro.yaml`
   - `configs/experiment/vae_mae_rzsm.yaml`
   - `configs/experiment/vae_phuber_rzsm.yaml`
-  - `configs/experiment/gptcast_16x16_rzsm_hydro.yaml`
-  - `configs/experiment/gptcast_16x16_rzsm_hydro_static.yaml`
+  - `configs/experiment/soilcast_16x16_rzsm_hydro.yaml`
+  - `configs/experiment/soilcast_16x16_rzsm_hydro_static.yaml`
 - 靜態特徵：
   - `data/build_era5land_static_features.py`
   - `data/download_soilgrids_static.py`
